@@ -283,6 +283,14 @@ static void gather_geometry_nodes_eval_dependencies(
                          has_enabled_nodes_of_type(ntree, "CompositorNodeMovieDistortion"_ustr) ||
                          has_enabled_nodes_of_type(ntree, "CompositorNodeMovieClip"_ustr) ||
                          has_enabled_nodes_of_type(ntree, "CompositorNodeKeyingScreen"_ustr);
+  /* Toast fork: kernels that read @Frame or @Time. */
+  for (const bNode *node : ntree.nodes_by_type("GeometryNodeToast"_ustr)) {
+    if (!node->is_muted() && node->storage &&
+        (static_cast<const NodeGeometryToast *>(node->storage)->flag & NODE_GEO_TOAST_USES_TIME))
+    {
+      deps.time_dependent = true;
+    }
+  }
 
   add_eval_dependencies_from_node_data(ntree, deps);
   add_own_transform_dependencies(ntree, deps);

@@ -341,6 +341,9 @@ set(SRC
   node_geometry_util.hh
 )
 
+# Toast fork nodes, appends to SRC.
+include(${CMAKE_CURRENT_SOURCE_DIR}/nodes/toast/toast_nodes.cmake)
+
 set(LIB
   PRIVATE bf::blenkernel
   PRIVATE bf::blenlib

@@ -11501,6 +11501,8 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("ShaderNode", "ShaderNodeGroup", def_group);
   define("CompositorNode", "CompositorNodeGroup", def_group);
   define("TextureNode", "TextureNodeGroup", def_group);
+  /* Toast fork nodes. */
+#include "../../nodes/geometry/nodes/toast/toast_rna_defines.inc"
   define("GeometryNode", "GeometryNodeGroup", def_group);
 
   /* clang-format on */

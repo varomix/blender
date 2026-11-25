@@ -4,6 +4,7 @@
 
 import bpy
 from bl_ui import node_add_menu
+from bl_ui.node_add_menu_toast import NODE_MT_gn_toast_base
 from bpy.app.translations import (
     pgettext_n as n_,
     contexts as i18n_contexts,
@@ -1106,6 +1107,8 @@ class NODE_MT_gn_all_base(node_add_menu.NodeMenu):
         self.draw_menu(layout, "Texture")
         self.draw_menu(layout, "Utilities")
         layout.separator()
+        self.draw_menu(layout, "Toast")
+        layout.separator()
         self.draw_root_assets(layout)
         layout.separator()
         self.draw_menu(layout, "Group")
@@ -1170,6 +1173,7 @@ add_menus = {
     "NODE_MT_category_utilities_matrix": NODE_MT_gn_utilities_matrix_base,
     "NODE_MT_category_GEO_UTILITIES_DEPRECATED": NODE_MT_gn_utilities_deprecated_base,
     "NODE_MT_category_utilities_sound": NODE_MT_gn_utilities_sound_base,
+    "NODE_MT_geometry_node_GEO_TOAST": NODE_MT_gn_toast_base,
     "NODE_MT_geometry_node_add_all": NODE_MT_gn_all_base,
 }
 add_menus = node_add_menu.generate_menus(
@@ -1237,6 +1241,7 @@ swap_menus = {
     "NODE_MT_gn_utilities_matrix_swap": NODE_MT_gn_utilities_matrix_base,
     "NODE_MT_gn_utilities_sound_swap": NODE_MT_gn_utilities_sound_base,
     "NODE_MT_gn_utilities_deprecated_swap": NODE_MT_gn_utilities_deprecated_base,
+    "NODE_MT_gn_toast_swap": NODE_MT_gn_toast_base,
     "NODE_MT_geometry_node_swap_all": NODE_MT_gn_all_base,
 }
 swap_menus = node_add_menu.generate_menus(

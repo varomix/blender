@@ -3757,6 +3757,34 @@ struct IndexSwitchItem {
   int identifier = 0;
 };
 
+/** Toast fork: #NodeGeometryToast.flag */
+enum {
+  /** The compiled kernel reads `@Frame` or `@Time`, so the node depends on time. */
+  NODE_GEO_TOAST_USES_TIME = 1 << 0,
+};
+
+/**
+ * Toast fork: storage of `GeometryNodeToast`. The code is the Text data-block in `bNode.id`.
+ * The strings are written by the Toast add-on after it compiles the code.
+ */
+struct NodeGeometryToast {
+  DNA_DEFINE_CXX_METHODS(NodeGeometryToast)
+
+  /** Signature JSON of the compiled kernel (parameters and attributes). */
+  char *signature = nullptr;
+  /** Path of the compiled kernel library. */
+  char *kernel_path = nullptr;
+  /** Compile error from the add-on, shown on the node. Empty when the code compiled. */
+  char *error = nullptr;
+  /** Hash of the source the kernel was built from, so the add-on can tell when it is stale. */
+  char *source_hash = nullptr;
+  /** Domain the code runs over, see `RunOver` in `node_geo_toast.cc`. */
+  int8_t run_over = 0;
+  /** `NODE_GEO_TOAST_*` flags, derived from the signature. */
+  int8_t flag = 0;
+  char _pad[6] = {};
+};
+
 struct NodeIndexSwitch {
   DNA_DEFINE_CXX_METHODS(NodeIndexSwitch)
 
