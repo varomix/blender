@@ -25,8 +25,9 @@ make update
 make
 ```
 
-Toast compiles kernels with a C++ compiler at run time: install g++ or clang++. The Toast node
-runs on Linux and macOS for now.
+Toast compiles kernels in memory with its built-in compiler, `libtoast_jit`, built from the
+clang and LLVM in Blender's precompiled libraries (Linux for now; elsewhere the add-on uses an
+installed g++ or clang++). The Toast node runs on Linux and macOS for now.
 
 `build_files/toast/package_portable.sh` makes a portable archive with the add-on, the plugins
 and a self-contained settings folder.

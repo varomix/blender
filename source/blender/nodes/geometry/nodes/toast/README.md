@@ -18,6 +18,7 @@ kernel node. Outside this folder, the fork changes only:
 | `source/creator/creator.cc`, `CMakeLists.txt` | load plugins at startup; install the Toast add-on as a core add-on |
 | `toast/addon` (submodule), `toast/README.md`, `.gitmodules` | the Toast add-on ([varomix/toast](https://github.com/varomix/toast)) |
 | `.lfsconfig` | fetch Blender's Git LFS files from projects.blender.org |
+| `nodes/geometry/nodes/toast/jit/` | `libtoast_jit`, the built-in kernel compiler (clang + ORC JIT, statically linked from `lib/<platform>/llvm`, exporting only its C functions) |
 | `source/creator/symbols_unix.map` | export Blender's C++ API for plugins |
 | `source/blender/editors/space_node/node_toast_plugins.cc` (+ `node_ops.cc`, `node_intern.hh`, `CMakeLists.txt`) | Reload Node Plugins operator |
 

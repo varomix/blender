@@ -21,6 +21,7 @@
  */
 
 #include <algorithm>
+#include <fstream>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -47,6 +48,7 @@
 #include "DNA_scene_types.h"
 #include "DNA_text_types.h"
 
+#include "BKE_appdir.hh"
 #include "BKE_attribute.hh"
 #include "BKE_bvh.hh"
 #include "BKE_geometry_fields.hh"
@@ -74,6 +76,7 @@
 #include "UI_interface_layout.hh"
 #include "UI_resources.hh"
 
+#include "jit/toast_jit.h"
 #include "node_geometry_util.hh"
 #include "toast_abi.h"
 
@@ -339,6 +342,46 @@ struct LoadedKernel {
   Signature signature;
 };
 
+static ToastJitCompileFn jit_compile = nullptr;
+static ToastJitSymbolFn jit_symbol = nullptr;
+
+/** The built-in compiler, `lib/libtoast_jit` next to the executable, loaded on first use. */
+static void *load_jit(std::string &r_error)
+{
+#ifdef _WIN32
+  r_error = "The built-in Toast compiler is not available on Windows yet";
+  return nullptr;
+#else
+  static void *handle = nullptr;
+  static std::string error;
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    const char *program_dir = BKE_appdir_program_dir();
+    const std::string path = std::string(program_dir ? program_dir : ".") + "/lib/libtoast_jit.so";
+    handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+      const char *err = dlerror();
+      error = "This Blender has no built-in Toast compiler (" + std::string(err ? err : path) +
+              "); set the Toast add-on to use an external compiler";
+    }
+    else {
+      auto api = reinterpret_cast<ToastJitApiVersionFn>(dlsym(handle, "toast_jit_api_version"));
+      jit_compile = reinterpret_cast<ToastJitCompileFn>(dlsym(handle, "toast_jit_compile"));
+      jit_symbol = reinterpret_cast<ToastJitSymbolFn>(dlsym(handle, "toast_jit_symbol"));
+      if (!api || api() != TOAST_JIT_API_VERSION || !jit_compile || !jit_symbol) {
+        error = "The built-in Toast compiler doesn't match this Blender";
+        handle = nullptr;
+      }
+    }
+  }
+  if (handle == nullptr) {
+    r_error = error;
+  }
+  return handle;
+#endif
+}
+
 /**
  * Kernels stay loaded for the whole session: another evaluation may still be running one, and
  * a new compile always gets a new path (the cache key), so nothing is ever replaced in place.
@@ -369,29 +412,63 @@ static const LoadedKernel *load_kernel(const StringRefNull path, std::string &r_
     return nullptr;
   };
 
-  void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (handle == nullptr) {
-    const char *err = dlerror();
-    return fail(std::string("Can't load kernel: ") + (err ? err : path.c_str()));
+  ToastAbiVersionFn abi_fn = nullptr;
+  ToastSignatureFn sig_fn = nullptr;
+  ToastKernelFn kernel_fn = nullptr;
+  void *handle = nullptr;
+  if (StringRef(path).endswith(".cpp")) {
+    /* C++ source: compile it with the built-in compiler. */
+    void *jit = load_jit(r_error);
+    if (jit == nullptr) {
+      return fail(r_error);
+    }
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file) {
+      return fail("Can't read kernel source " + std::string(path));
+    }
+    std::stringstream source;
+    source << file.rdbuf();
+    const std::string cache_path = std::string(path).substr(0, path.size() - 4);
+    char error[4096] = "";
+    void *module = jit_compile(source.str().c_str(), cache_path.c_str(), error, sizeof(error));
+    if (module == nullptr) {
+      return fail(std::string("Kernel compile failed: ") + error);
+    }
+    abi_fn = reinterpret_cast<ToastAbiVersionFn>(jit_symbol(module, "toast_abi_version"));
+    sig_fn = reinterpret_cast<ToastSignatureFn>(jit_symbol(module, "toast_signature"));
+    kernel_fn = reinterpret_cast<ToastKernelFn>(jit_symbol(module, "toast_kernel"));
+    UNUSED_VARS(jit);
   }
-  auto abi_fn = reinterpret_cast<ToastAbiVersionFn>(dlsym(handle, "toast_abi_version"));
-  auto sig_fn = reinterpret_cast<ToastSignatureFn>(dlsym(handle, "toast_signature"));
-  auto kernel_fn = reinterpret_cast<ToastKernelFn>(dlsym(handle, "toast_kernel"));
+  else {
+    handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+      const char *err = dlerror();
+      return fail(std::string("Can't load kernel: ") + (err ? err : path.c_str()));
+    }
+    abi_fn = reinterpret_cast<ToastAbiVersionFn>(dlsym(handle, "toast_abi_version"));
+    sig_fn = reinterpret_cast<ToastSignatureFn>(dlsym(handle, "toast_signature"));
+    kernel_fn = reinterpret_cast<ToastKernelFn>(dlsym(handle, "toast_kernel"));
+  }
+  auto close = [&]() {
+    if (handle) {
+      dlclose(handle);
+    }
+  };
   if (!abi_fn || !sig_fn || !kernel_fn) {
-    dlclose(handle);
+    close();
     return fail("Not a Toast kernel: " + std::string(path));
   }
   /* Read before any dlclose: the functions are gone once the library is closed. */
   const int32_t abi = abi_fn();
   if (abi != TOAST_ABI_VERSION) {
-    dlclose(handle);
+    close();
     return fail("Kernel built for Toast ABI " + std::to_string(abi) + ", this Blender uses " +
                 std::to_string(TOAST_ABI_VERSION) + ". It is recompiled automatically when the "
                 "Toast add-on is enabled");
   }
   std::optional<Signature> sig = parse_signature(sig_fn());
   if (!sig) {
-    dlclose(handle);
+    close();
     return fail("Kernel has an invalid signature: " + std::string(path));
   }
 
