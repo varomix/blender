@@ -1540,6 +1540,8 @@ UserDef *BKE_blendfile_userdef_from_defaults()
         "cycles",
         "pose_library",
         "bl_pkg",
+        /* Toast fork: the Toast add-on (bundled in `addons_core` by the portable package). */
+        "toast",
     };
     for (int i = 0; i < ARRAY_SIZE(addons); i++) {
       bAddon *addon = BKE_addon_new();
