@@ -58,6 +58,20 @@ supported. Point and corner attributes are interpolated, face attributes copied.
 
 ## Tests
 
+`tests/bricker_golden.py` is Bricker's regression test: it builds ten input meshes (grids, a cube,
+a concave L, a tilted quad, a closed sphere, partial selections with and without Fix Shared
+Edges, with point, face and UV attributes), runs Bricker and compares with
+`tests/bricker_golden.json` (topology exactly, positions and attributes within 1e-5):
+
+```
+../build_linux_5.3/bin/blender -b --factory-startup --python tests/bricker_golden.py
+```
+
+Add `-- --update` to regenerate the expected output after an intended change. The inputs list
+their edges explicitly: Bricker's output order follows the input's edge order, which Blender's
+primitive operators don't keep stable between runs.
+
+
 `tests/verify_bricker.py` compares the node against reference JSON files (input meshes and the
 expected divided meshes, with attributes):
 
