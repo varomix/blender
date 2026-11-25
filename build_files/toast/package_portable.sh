@@ -45,6 +45,9 @@ mkdir -p "$VERSION_DIR/scripts/addons_core"
 rm -rf "$VERSION_DIR/scripts/addons_core/toast"  # A development install may be a symbolic link.
 rsync -a --exclude '__pycache__' "$TOAST_ADDON_DIR/toast/" "$VERSION_DIR/scripts/addons_core/toast/"
 cp "$TOAST_ADDON_DIR/docs/guide.md" "$STAGE/$NAME/TOAST_GUIDE.md"
+if [ -f "$TOAST_ADDON_DIR/docs/guide.html" ]; then
+  cp "$TOAST_ADDON_DIR/docs/guide.html" "$STAGE/$NAME/TOAST_GUIDE.html"
+fi
 # The built-in kernel compiler carries clang and LLVM: drop its symbol tables.
 if [ -f "$STAGE/$NAME/lib/libtoast_jit.so" ]; then
   strip --strip-unneeded "$STAGE/$NAME/lib/libtoast_jit.so"
@@ -67,8 +70,8 @@ Toast turns code into native kernels with its built-in compiler: nothing else to
 Compiled kernels are cached in ~/.cache/toast.
 
 Allow Preferences > Save & Load > Auto Run Python Scripts (or trust the file) for Toast nodes
-to run. Start with Add > Toast > Toast in a Geometry Nodes tree; TOAST_GUIDE.md explains the
-language and has a cookbook.
+to run. Start with Add > Toast > Toast in a Geometry Nodes tree; TOAST_GUIDE.html (open it in a
+browser, or read TOAST_GUIDE.md) explains the language and has a cookbook.
 README
 
 mkdir -p "$OUT_DIR"
