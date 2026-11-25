@@ -2819,10 +2819,12 @@ static void defer_free_tree_type(bNodeTreeType *tree_type)
   scope.add_destruct_call([tree_type]() { MEM_delete(tree_type); });
 }
 
-static void defer_free_node_type(bNodeType *ntype)
+static void defer_free_node_type(bNodeType *ntype, nodes::NodeDeclaration *static_declaration)
 {
   static ResourceScope scope;
-  scope.add_destruct_call([ntype]() {
+  scope.add_destruct_call([ntype, static_declaration]() {
+    /* Toast fork: deferred like the type, since depsgraph copies of nodes still point to it. */
+    delete static_declaration;
     /* May be null if the type is statically allocated. */
     if (ntype->free_self) {
       ntype->free_self(ntype);
@@ -2906,15 +2908,15 @@ static void node_free_type(void *nodetype_v)
    * or we'd want to update *all* active Mains, which we cannot do anyway currently. */
   update_typeinfo(G_MAIN, nullptr, nodetype, nullptr, true);
 
-  /* Setting this to null is necessary for the case of static node types. When running tests,
-   * they may be registered and unregistered multiple times. */
-  delete nodetype->static_declaration;
-  nodetype->static_declaration = nullptr;
-
-  /* Defer freeing the node type, because it may still be referenced by nodes in depsgraph
-   * copies. We can't just remove these node types, because the depsgraph may exist completely
-   * separate from original data. */
-  defer_free_node_type(nodetype);
+  /* Defer freeing the node type and its static declaration, because they may still be referenced
+   * by nodes in depsgraph copies. We can't just remove these node types, because the depsgraph
+   * may exist completely separate from original data.
+   *
+   * Toast fork: the declaration used to be deleted right away, which left depsgraph copies of
+   * nodes of a type unregistered at run time (C++ node plugins) with a dangling pointer, freed
+   * again when the copy is freed. The type keeps pointing to it until it is registered again,
+   * so #node_free_node still recognizes it as shared. */
+  defer_free_node_type(nodetype, nodetype->static_declaration);
 }
 
 void node_register_type(bNodeType &nt)
