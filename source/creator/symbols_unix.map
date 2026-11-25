@@ -37,6 +37,27 @@ global:
   realpath*;
   sched_*;
   valloc*;
+  /* Toast fork: Blender's own C++ API (namespace `blender`), for C++ node plugins loaded at run
+   * time. Includes vtables, type info and function-local statics, so a plugin shares singletons
+   * such as #CPPType with Blender instead of getting its own copies. */
+  /* Any cv/ref qualifiers between `_ZN` and the namespace (e.g. `_ZNKR7blender`). */
+  _ZN*7blender*;
+  _ZZN*7blender*;
+  _ZGV*7blender*;
+  _ZT*7blender*;
+  /* C-style API, including the C++ (mangled) free functions with these prefixes. */
+  _Z*BLI_*;
+  _Z*BKE_*;
+  _Z*MEM_*;
+  _Z*DEG_*;
+  _Z*RNA_*;
+  MEM_*;
+  BLI_*;
+  BKE_*;
+  RNA_*;
+  DEG_*;
+  G;
+  U;
   /* Needed on FreeBSD. Uses wildcard to avoid linker error when symbols are not found. */
   __progname*;
   environ*;

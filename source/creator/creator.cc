@@ -52,6 +52,8 @@
 #include "BKE_material.hh"
 #include "BKE_modifier.hh"
 #include "BKE_node.hh"
+
+#include "NOD_toast_plugins.hh"
 #include "BKE_particle.h"
 #include "BKE_shader_fx.hh"
 #include "BKE_sound.hh"
@@ -580,6 +582,8 @@ int main(int argc,
   RE_texture_rng_init();
   RE_engines_init();
   bke::node_system_init();
+  /* Toast fork: C++ node plugins, after built-in node types and RNA. */
+  nodes::toast_plugins::load_all();
 
   BKE_brush_system_init();
   BKE_particle_init_rng();

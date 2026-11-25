@@ -403,6 +403,8 @@ void node_select_paired(bNodeTree &node_tree);
 void node_select_single(bContext &C, bNode &node);
 
 void NODE_OT_select(wmOperatorType *ot);
+/* Toast fork. */
+void NODE_OT_toast_reload_plugins(wmOperatorType *ot);
 void NODE_OT_select_all(wmOperatorType *ot);
 void NODE_OT_select_linked_to(wmOperatorType *ot);
 void NODE_OT_select_linked_from(wmOperatorType *ot);

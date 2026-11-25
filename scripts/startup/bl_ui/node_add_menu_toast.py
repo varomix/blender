@@ -25,5 +25,7 @@ class NODE_MT_gn_toast_base(node_add_menu.NodeMenu):
             if getattr(bpy.types, idname, None) is not None:
                 self.node_operator(layout, idname)
 
+        layout.separator()
+        layout.operator("node.toast_reload_plugins", icon="FILE_REFRESH")
 
         self.draw_assets_for_catalog(layout, self.bl_label)

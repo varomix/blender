@@ -25,6 +25,7 @@ namespace ed::space_node {
 void node_operatortypes()
 {
   WM_operatortype_append(NODE_OT_select);
+  WM_operatortype_append(NODE_OT_toast_reload_plugins);
   WM_operatortype_append(NODE_OT_select_all);
   WM_operatortype_append(NODE_OT_select_linked_to);
   WM_operatortype_append(NODE_OT_select_linked_from);

@@ -42,6 +42,7 @@ set(SRC
   node_ops.cc
   node_relationships.cc
   node_select.cc
+  node_toast_plugins.cc
   node_shader_preview.cc
   node_socket_tooltip.cc
   node_sync_sockets.cc
@@ -83,6 +84,14 @@ endif()
 
 if(WITH_OPENSUBDIV)
   add_definitions(-DWITH_OPENSUBDIV)
+endif()
+
+# Toast fork: Reload Node Plugins releases Python references to plugin node types.
+if(WITH_PYTHON)
+  list(APPEND INC
+    ../../python
+  )
+  add_definitions(-DWITH_PYTHON)
 endif()
 
 blender_add_lib(bf_editor_space_node "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
