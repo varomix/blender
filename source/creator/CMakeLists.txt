@@ -489,6 +489,31 @@ if(WITH_PYTHON)
     PATTERN "addons_core/bl_pkg/example_extension" EXCLUDE
   )
 
+  # Toast fork: the Toast add-on (the `toast/addon` submodule) as a core add-on.
+  set(TOAST_ADDON_DIR "${CMAKE_SOURCE_DIR}/toast/addon" CACHE PATH
+    "Toast add-on repository; its toast/ package is installed as a core add-on")
+  option(TOAST_ADDON_LINK "Install the Toast add-on as a symbolic link (for development)" OFF)
+  mark_as_advanced(TOAST_ADDON_DIR TOAST_ADDON_LINK)
+  if(EXISTS "${TOAST_ADDON_DIR}/toast/__init__.py")
+    if(TOAST_ADDON_LINK)
+      install(CODE "
+        file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${TARGETDIR_VER}/scripts/addons_core\")
+        file(REMOVE_RECURSE \"\${CMAKE_INSTALL_PREFIX}/${TARGETDIR_VER}/scripts/addons_core/toast\")
+        file(CREATE_LINK \"${TOAST_ADDON_DIR}/toast\"
+          \"\${CMAKE_INSTALL_PREFIX}/${TARGETDIR_VER}/scripts/addons_core/toast\" SYMBOLIC)
+      ")
+    else()
+      install(
+        DIRECTORY ${TOAST_ADDON_DIR}/toast
+        DESTINATION ${TARGETDIR_VER}/scripts/addons_core
+        PATTERN "__pycache__" EXCLUDE
+      )
+    endif()
+  else()
+    message(WARNING "Toast add-on not found in ${TOAST_ADDON_DIR}, "
+                    "run: git submodule update --init toast/addon")
+  endif()
+
   if(WITH_PYTHON_MODULE)
     install(
       FILES ${CMAKE_SOURCE_DIR}/scripts/site/sitecustomize.py

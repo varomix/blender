@@ -8,9 +8,9 @@
 # run `./blender` inside it. It keeps its preferences in its own `<version>/portable` folder, so
 # it never touches an installed Blender or its settings.
 #
-# Usage: TOAST_ADDON_DIR=<toast repo> build_files/toast/package_portable.sh [BUILD_DIR] [OUT_DIR]
+# Usage: build_files/toast/package_portable.sh [BUILD_DIR] [OUT_DIR]
 #   FORMAT=zip  ...   # .zip instead of .tar.xz
-# TOAST_ADDON_DIR is the Toast frontend repository (it contains `toast/` and `docs/`).
+# TOAST_ADDON_DIR is the Toast add-on repository (default: the `toast/addon` submodule).
 
 set -euo pipefail
 
@@ -18,9 +18,9 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="$(realpath "${1:-$SRC_DIR/../build_linux_5.3}")"
 OUT_DIR="$(realpath -m "${2:-$SRC_DIR/../packages}")"
 FORMAT="${FORMAT:-tar.xz}"
-TOAST_ADDON_DIR="$(realpath "${TOAST_ADDON_DIR:?set TOAST_ADDON_DIR to the Toast add-on repository}")"
+TOAST_ADDON_DIR="$(realpath "${TOAST_ADDON_DIR:-$SRC_DIR/toast/addon}")"
 if [ ! -f "$TOAST_ADDON_DIR/toast/__init__.py" ]; then
-  echo "TOAST_ADDON_DIR=$TOAST_ADDON_DIR does not contain toast/__init__.py" >&2
+  echo "TOAST_ADDON_DIR=$TOAST_ADDON_DIR does not contain toast/__init__.py (git submodule update --init toast/addon)" >&2
   exit 1
 fi
 
@@ -42,6 +42,7 @@ VERSION_DIR="$STAGE/$NAME/$(echo "$BLENDER_VERSION" | cut -d. -f1-2)"
 
 # The Toast add-on as a core add-on (enabled by default in factory preferences).
 mkdir -p "$VERSION_DIR/scripts/addons_core"
+rm -rf "$VERSION_DIR/scripts/addons_core/toast"  # A development install may be a symbolic link.
 rsync -a --exclude '__pycache__' "$TOAST_ADDON_DIR/toast/" "$VERSION_DIR/scripts/addons_core/toast/"
 cp "$TOAST_ADDON_DIR/docs/guide.md" "$STAGE/$NAME/TOAST_GUIDE.md"
 # Keep preferences and user scripts inside the package.

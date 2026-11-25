@@ -23,3 +23,7 @@
 	path = lib/windows_arm64
 	url = https://projects.blender.org/blender/lib-windows_arm64.git
 	branch = blender-v5.3-release
+[submodule "toast/addon"]
+	path = toast/addon
+	url = https://github.com/varomix/toast.git
+	branch = main

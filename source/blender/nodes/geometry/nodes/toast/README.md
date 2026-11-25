@@ -15,7 +15,9 @@ kernel node. Outside this folder, the fork changes only:
 | `source/blender/nodes/intern/dependencies.cc` | Toast kernels using `@Frame`/`@Time` are time dependent |
 | `source/blender/nodes/NOD_toast_plugins.hh` | new file, C++ node plugin API |
 | `source/blender/blenkernel/intern/node.cc` | static declarations freed with their (deferred) node type |
-| `source/creator/creator.cc`, `CMakeLists.txt` | load plugins at startup |
+| `source/creator/creator.cc`, `CMakeLists.txt` | load plugins at startup; install the Toast add-on as a core add-on |
+| `toast/addon` (submodule), `toast/README.md`, `.gitmodules` | the Toast add-on ([varomix/toast](https://github.com/varomix/toast)) |
+| `.lfsconfig` | fetch Blender's Git LFS files from projects.blender.org |
 | `source/creator/symbols_unix.map` | export Blender's C++ API for plugins |
 | `source/blender/editors/space_node/node_toast_plugins.cc` (+ `node_ops.cc`, `node_intern.hh`, `CMakeLists.txt`) | Reload Node Plugins operator |
 
@@ -65,7 +67,7 @@ expected divided meshes, with attributes):
 
 ## Distribution
 
-`TOAST_ADDON_DIR=<toast repo> build_files/toast/package_portable.sh` builds, installs and writes
+`build_files/toast/package_portable.sh` builds, installs and writes
 `../packages/blender-<version>-toast-<hash>-<os>-<arch>.tar.xz` (or `.zip` with `FORMAT=zip`):
 the build without its build tools, the C++ node plugins, the Toast add-on in `addons_core`
 (enabled by default: it is in the factory add-on list in `blendfile.cc`), a `portable` folder so
