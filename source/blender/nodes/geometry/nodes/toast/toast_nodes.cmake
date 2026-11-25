@@ -47,6 +47,10 @@ function(toast_add_node_plugins)
   toast_add_node_plugin(toast_plugin_bricker
     ${CMAKE_CURRENT_SOURCE_DIR}/nodes/toast/plugins/bricker/node_geo_bricker.cc
   )
+  # Hand-written C++ reference for the Toast benchmark.
+  toast_add_node_plugin(toast_plugin_noise_displace
+    ${CMAKE_CURRENT_SOURCE_DIR}/nodes/toast/plugins/noise_displace/node_geo_noise_displace.cc
+  )
 endfunction()
 
 # Deferred so the plugins see the final settings of `bf_nodes_geometry`.
