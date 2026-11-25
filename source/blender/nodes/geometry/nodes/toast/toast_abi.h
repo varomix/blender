@@ -15,7 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#define TOAST_ABI_VERSION 4
+#define TOAST_ABI_VERSION 5
 
 extern "C" {
 
@@ -28,6 +28,8 @@ enum {
   TOAST_TYPE_FLOAT2 = 3,
   TOAST_TYPE_FLOAT3 = 4,
   TOAST_TYPE_FLOAT4 = 5,
+  TOAST_TYPE_QUAT = 6,
+  TOAST_TYPE_MAT4 = 7,
 };
 
 enum {
@@ -35,6 +37,8 @@ enum {
   TOAST_DOMAIN_FACE = 1,
   TOAST_DOMAIN_EDGE = 2,
   TOAST_DOMAIN_CORNER = 3,
+  TOAST_DOMAIN_CURVE = 4,
+  TOAST_DOMAIN_INSTANCE = 5,
 };
 
 typedef struct ToastHit {
@@ -83,6 +87,10 @@ typedef struct ToastHost {
                       ToastHit *out);
   int32_t (*closest_point)(
       void *self, int32_t input, const float *pos, float max_dist, ToastHit *out);
+  /* ABI 5. */
+  int64_t (*ncurves)(void *self, int32_t input);
+  int32_t (*curve_points)(void *self, int32_t input, int64_t curve, int32_t max, int64_t *out);
+  void (*cmd_remove_curve)(void *self, ToastCmdBuffer *cmd, int64_t src, int64_t curve);
 } ToastHost;
 
 typedef struct ToastCtx {
@@ -106,7 +114,7 @@ typedef const char *(*ToastSignatureFn)();
 
 /* Layout checks; the same values are asserted by the harness through ctypes. */
 static_assert(sizeof(ToastAttr) == 24);
-static_assert(sizeof(ToastHost) == 128);
+static_assert(sizeof(ToastHost) == 152);
 static_assert(sizeof(ToastHit) == 60);
 static_assert(offsetof(ToastCtx, begin) == 8);
 static_assert(offsetof(ToastCtx, attrs) == 40);

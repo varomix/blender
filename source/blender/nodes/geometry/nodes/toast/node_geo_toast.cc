@@ -43,6 +43,7 @@
 #include "BLI_task.hh"
 #include "BLI_vector.hh"
 
+#include "DNA_curves_types.h"
 #include "DNA_mesh_types.h"
 #include "DNA_pointcloud_types.h"
 #include "DNA_scene_types.h"
@@ -51,8 +52,10 @@
 #include "BKE_appdir.hh"
 #include "BKE_attribute.hh"
 #include "BKE_bvh.hh"
+#include "BKE_curves.hh"
 #include "BKE_geometry_fields.hh"
 #include "BKE_global.hh"
+#include "BKE_instances.hh"
 #include "BKE_lib_id.hh"
 #include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
@@ -94,6 +97,8 @@ enum class RunOver : int8_t {
   Corners = 3,
   /* Once for the whole geometry (stored value 4, files saved with "Detail" keep working). */
   Geometry = 4,
+  Curves = 5,
+  Instances = 6,
 };
 
 static const EnumPropertyItem run_over_items[] = {
@@ -105,6 +110,12 @@ static const EnumPropertyItem run_over_items[] = {
      ICON_NONE,
      "Face Corners",
      "Run the code once for every face corner"},
+    {int(RunOver::Curves), "CURVES", ICON_NONE, "Curves", "Run the code once for every curve"},
+    {int(RunOver::Instances),
+     "INSTANCES",
+     ICON_NONE,
+     "Instances",
+     "Run the code once for every instance (of the top-level geometry)"},
     {int(RunOver::Geometry),
      "GEOMETRY",
      ICON_NONE,
@@ -128,6 +139,12 @@ static std::optional<AttrDomain> run_domain(const StringRef run_over)
   if (run_over == "corners") {
     return AttrDomain::Corner;
   }
+  if (run_over == "curves") {
+    return AttrDomain::Curve;
+  }
+  if (run_over == "instances") {
+    return AttrDomain::Instance;
+  }
   return std::nullopt;
 }
 
@@ -140,6 +157,10 @@ static int32_t abi_domain(const AttrDomain domain)
       return TOAST_DOMAIN_EDGE;
     case AttrDomain::Corner:
       return TOAST_DOMAIN_CORNER;
+    case AttrDomain::Curve:
+      return TOAST_DOMAIN_CURVE;
+    case AttrDomain::Instance:
+      return TOAST_DOMAIN_INSTANCE;
     default:
       return TOAST_DOMAIN_POINT;
   }
@@ -158,6 +179,12 @@ static std::optional<AttrDomain> domain_from_string(const StringRef domain)
   }
   if (domain == "corner") {
     return AttrDomain::Corner;
+  }
+  if (domain == "curve") {
+    return AttrDomain::Curve;
+  }
+  if (domain == "instance") {
+    return AttrDomain::Instance;
   }
   return std::nullopt;
 }
@@ -544,7 +571,7 @@ class NearPointsQuery {
   }
 };
 
-enum class CmdKind : int8_t { AddPoint, AddPrim, RemovePoint, RemovePrim, SetAttr };
+enum class CmdKind : int8_t { AddPoint, AddPrim, RemovePoint, RemovePrim, SetAttr, RemoveCurve };
 
 struct Cmd {
   CmdKind kind;
@@ -581,6 +608,8 @@ struct HostData {
   Span<ToastAttr> bindings;
   /* Meshes for ray_cast/closest_point, as they were before the run. */
   std::array<const Mesh *, MAX_INPUTS> surface_meshes = {};
+  /* For curve queries; null for inputs without curves. */
+  std::array<const bke::CurvesGeometry *, MAX_INPUTS> curves = {};
 };
 
 static int32_t fill_hit(const Mesh &mesh,
@@ -674,7 +703,10 @@ static int64_t type_size(const int32_t type_code)
     case TOAST_TYPE_FLOAT3:
       return 12;
     case TOAST_TYPE_FLOAT4:
+    case TOAST_TYPE_QUAT:
       return 16;
+    case TOAST_TYPE_MAT4:
+      return 64;
   }
   return 0;
 }
@@ -843,6 +875,45 @@ static int64_t host_nprims(void *self, const int32_t input)
   return host.meshes[input]->faces_num;
 }
 
+static int64_t host_ncurves(void *self, const int32_t input)
+{
+  const HostData &host = *static_cast<const HostData *>(self);
+  if (input < 0 || input >= MAX_INPUTS || host.curves[input] == nullptr) {
+    return 0;
+  }
+  return host.curves[input]->curves_num();
+}
+
+static int32_t host_curve_points(
+    void *self, const int32_t input, const int64_t curve, const int32_t max, int64_t *out)
+{
+  const HostData &host = *static_cast<const HostData *>(self);
+  if (input < 0 || input >= MAX_INPUTS || host.curves[input] == nullptr) {
+    return 0;
+  }
+  const bke::CurvesGeometry &curves = *host.curves[input];
+  if (curve < 0 || curve >= curves.curves_num()) {
+    return 0;
+  }
+  const IndexRange points = curves.points_by_curve()[curve];
+  const int64_t n = std::min<int64_t>(points.size(), std::max(max, 0));
+  for (const int64_t k : IndexRange(n)) {
+    out[k] = points[k];
+  }
+  return int32_t(points.size());
+}
+
+static void host_remove_curve(void * /*self*/,
+                              ToastCmdBuffer *cmd,
+                              const int64_t src,
+                              const int64_t curve)
+{
+  CmdBuffer &buffer = *reinterpret_cast<CmdBuffer *>(cmd);
+  Cmd c{CmdKind::RemoveCurve, src, float3(0.0f)};
+  c.point = curve;
+  buffer.cmds.append(c);
+}
+
 static int32_t host_primpoints(
     void *self, const int32_t input, const int64_t prim, const int32_t max, int64_t *out)
 {
@@ -931,6 +1002,10 @@ static std::optional<AttrType> attr_type_from_code(const int code)
       return AttrType::Float3;
     case TOAST_TYPE_FLOAT4:
       return AttrType::Float4;
+    case TOAST_TYPE_QUAT:
+      return AttrType::Quaternion;
+    case TOAST_TYPE_MAT4:
+      return AttrType::Float4x4;
   }
   return std::nullopt;
 }
@@ -960,56 +1035,150 @@ static std::string color_attribute_name(const Mesh *mesh)
 
 /**
  * Blender name of a Toast attribute. Toast uses Blender's names, except `color`, which is the
- * active color attribute. `mesh` is the mesh being read or written, if any.
+ * active color attribute, and `transform` on instances, which is `instance_transform`. `mesh` is
+ * the mesh being read or written, if any.
  */
-static std::string blender_name(const StringRef name, const Mesh *mesh)
+static std::string blender_name(const StringRef name, const Mesh *mesh, const AttrDomain domain)
 {
   if (name == "color") {
     return color_attribute_name(mesh);
   }
+  if (name == "transform" && domain == AttrDomain::Instance) {
+    return "instance_transform";
+  }
   return name;
 }
 
-/** The points of one geometry: the mesh if it has vertices, otherwise the point cloud. */
+/** Which component of a geometry "points" refer to. */
+enum class PointsKind : int8_t { None, Mesh, PointCloud, Curves, Instances };
+
+/**
+ * The parts of one geometry the kernel reads. Points are those of `points_kind`; faces, edges
+ * and corners are the mesh's; curves and instances their components'.
+ */
 struct PointsSource {
   const Mesh *mesh = nullptr;
   const PointCloud *pointcloud = nullptr;
+  const Curves *curves = nullptr;
+  const bke::Instances *instances = nullptr;
+  PointsKind points_kind = PointsKind::None;
 
   int64_t size() const
   {
-    return mesh ? mesh->verts_num : (pointcloud ? pointcloud->totpoint : 0);
+    switch (points_kind) {
+      case PointsKind::Mesh:
+        return mesh->verts_num;
+      case PointsKind::PointCloud:
+        return pointcloud->totpoint;
+      case PointsKind::Curves:
+        return curves->geometry.point_num;
+      case PointsKind::Instances:
+        return instances->instances_num();
+      case PointsKind::None:
+        break;
+    }
+    return 0;
   }
-  /** Element count of a domain; point clouds only have points. */
+  /** Attributes of a domain, from the component that has it. */
+  std::optional<bke::AttributeAccessor> attributes(const AttrDomain domain) const
+  {
+    switch (domain) {
+      case AttrDomain::Point:
+        switch (points_kind) {
+          case PointsKind::Mesh:
+            return mesh->attributes();
+          case PointsKind::PointCloud:
+            return pointcloud->attributes();
+          case PointsKind::Curves:
+            return curves->geometry.wrap().attributes();
+          default:
+            return std::nullopt;
+        }
+      case AttrDomain::Curve:
+        return curves ? std::optional(curves->geometry.wrap().attributes()) : std::nullopt;
+      case AttrDomain::Instance:
+        return instances ? std::optional(instances->attributes()) : std::nullopt;
+      default:
+        return mesh ? std::optional(mesh->attributes()) : std::nullopt;
+    }
+  }
+  /** Element count of a domain. */
   int64_t size(const AttrDomain domain) const
   {
-    if (mesh) {
-      return mesh->attributes().domain_size(domain);
+    if (domain == AttrDomain::Point) {
+      return this->size();
     }
-    return domain == AttrDomain::Point ? this->size() : 0;
+    if (domain == AttrDomain::Instance) {
+      return instances ? instances->instances_num() : 0;
+    }
+    const std::optional<bke::AttributeAccessor> attributes = this->attributes(domain);
+    return attributes && attributes->domain_supported(domain) ? attributes->domain_size(domain) :
+                                                                0;
   }
-  std::optional<bke::AttributeAccessor> attributes() const
+  /** Positions of the points (for instances: their transforms' translation). */
+  VArray<float3> positions() const
   {
-    if (mesh) {
-      return mesh->attributes();
+    if (points_kind == PointsKind::Instances) {
+      return bke::instance_position_varray(*instances);
     }
-    if (pointcloud) {
-      return pointcloud->attributes();
+    const std::optional<bke::AttributeAccessor> attributes = this->attributes(AttrDomain::Point);
+    if (!attributes) {
+      return {};
     }
-    return std::nullopt;
+    return *attributes->lookup_or_default<float3>("position", AttrDomain::Point, float3(0.0f));
   }
 };
 
+/** Input 1: every component, with points from the mesh, else the point cloud, curves or instances. */
 static PointsSource points_of(const GeometrySet &geometry)
 {
   PointsSource source;
-  const Mesh *mesh = geometry.get_mesh();
-  if (mesh && mesh->verts_num > 0) {
-    source.mesh = mesh;
-    return source;
-  }
+  source.mesh = geometry.get_mesh();
   source.pointcloud = geometry.get_pointcloud();
-  if (source.pointcloud == nullptr) {
-    source.mesh = mesh;
+  source.curves = geometry.get_curves();
+  source.instances = geometry.get_instances();
+  if (source.mesh && source.mesh->verts_num > 0) {
+    source.points_kind = PointsKind::Mesh;
+  }
+  else if (source.pointcloud && source.pointcloud->totpoint > 0) {
+    source.points_kind = PointsKind::PointCloud;
+  }
+  else if (source.curves && source.curves->geometry.point_num > 0) {
+    source.points_kind = PointsKind::Curves;
+  }
+  else if (source.instances && source.instances->instances_num() > 0) {
+    source.points_kind = PointsKind::Instances;
+  }
+  else if (source.mesh) {
+    source.points_kind = PointsKind::Mesh;
+  }
+  return source;
+}
+
+/** Input 0: only the component the kernel runs on. */
+static PointsSource component_source(const GeometrySet &geometry,
+                                     const bke::GeometryComponent::Type type)
+{
+  PointsSource source;
+  switch (type) {
+    case bke::GeometryComponent::Type::Mesh:
+      source.mesh = geometry.get_mesh();
+      source.points_kind = source.mesh ? PointsKind::Mesh : PointsKind::None;
+      break;
+    case bke::GeometryComponent::Type::PointCloud:
+      source.pointcloud = geometry.get_pointcloud();
+      source.points_kind = source.pointcloud ? PointsKind::PointCloud : PointsKind::None;
+      break;
+    case bke::GeometryComponent::Type::Curve:
+      source.curves = geometry.get_curves();
+      source.points_kind = source.curves ? PointsKind::Curves : PointsKind::None;
+      break;
+    case bke::GeometryComponent::Type::Instance:
+      source.instances = geometry.get_instances();
+      source.points_kind = source.instances ? PointsKind::Instances : PointsKind::None;
+      break;
+    default:
+      break;
   }
   return source;
 }
@@ -1038,8 +1207,17 @@ static bool read_attribute(const PointsSource &source,
   const CPPType &cpp_type = bke::attribute_type_to_cpp_type(type);
   const AttrDomain domain = attr.domain;
   const int64_t size = source.size(domain);
-  std::optional<bke::AttributeAccessor> attributes = source.attributes();
-  const std::string name = blender_name(attr.name, source.mesh);
+  std::optional<bke::AttributeAccessor> attributes = source.attributes(domain);
+  const std::string name = blender_name(attr.name, source.mesh, domain);
+  if (attr.name == "position" && domain == AttrDomain::Instance && source.instances &&
+      type == AttrType::Float3)
+  {
+    r_binding.copy = GArray<>(cpp_type, size);
+    array_utils::copy(bke::instance_position_varray(*source.instances),
+                      r_binding.copy.as_mutable_span().typed<float3>());
+    r_binding.data = r_binding.copy.data();
+    return true;
+  }
   if (attributes && attributes->contains(name)) {
     bke::GAttributeReader reader = attributes->lookup(name, domain, type);
     if (!reader) {
@@ -1092,10 +1270,11 @@ struct MergedCommands {
   Vector<Vector<int>> new_prims;
   Vector<int> removed;
   Vector<int> removed_prims;
+  Vector<int> removed_curves;
   bool has_changes() const
   {
     return !new_positions.is_empty() || !new_prims.is_empty() || !removed.is_empty() ||
-           !removed_prims.is_empty();
+           !removed_prims.is_empty() || !removed_curves.is_empty();
   }
 };
 
@@ -1106,6 +1285,7 @@ struct MergedCommands {
 static bool merge_commands(Span<CmdBuffer> buffers,
                            const int64_t points_num,
                            const int64_t prims_num,
+                           const int64_t curves_num,
                            MergedCommands &r_merged,
                            std::string &r_error)
 {
@@ -1166,6 +1346,18 @@ static bool merge_commands(Span<CmdBuffer> buffers,
             return false;
           }
           r_merged.removed_prims.append(int(cmd.point));
+          break;
+        }
+        case CmdKind::RemoveCurve: {
+          if (curves_num == 0) {
+            r_error = "remove_curve() needs curves, the code ran on a mesh or point cloud";
+            return false;
+          }
+          if (cmd.point < 0 || cmd.point >= curves_num) {
+            r_error = "Curve " + std::to_string(cmd.point) + " does not exist";
+            return false;
+          }
+          r_merged.removed_curves.append(int(cmd.point));
           break;
         }
         case CmdKind::RemovePoint: {
@@ -1340,6 +1532,59 @@ static bool apply_to_pointcloud(GeometrySet &geometry,
   return true;
 }
 
+static bool apply_to_curves(GeometrySet &geometry,
+                            const MergedCommands &merged,
+                            const bke::AttributeFilter &attribute_filter,
+                            std::string &r_error)
+{
+  if (!merged.new_positions.is_empty() || !merged.new_prims.is_empty() ||
+      !merged.removed_prims.is_empty())
+  {
+    r_error = "add_point(), add_edge(), add_face() and remove_face() need a mesh, the code ran on "
+              "curves";
+    return false;
+  }
+  const Curves &src_id = *geometry.get_curves();
+  const bke::CurvesGeometry &src = src_id.geometry.wrap();
+  /* Removing a curve removes its points; curves left without points are removed. */
+  Array<bool> keep(src.points_num(), true);
+  for (const int i : merged.removed) {
+    keep[i] = false;
+  }
+  const OffsetIndices<int> points_by_curve = src.points_by_curve();
+  for (const int curve : merged.removed_curves) {
+    keep.as_mutable_span().slice(points_by_curve[curve]).fill(false);
+  }
+  IndexMaskMemory memory;
+  const IndexMask kept = IndexMask::from_bools(keep, memory);
+  Curves *dst = bke::curves_new_nomain(
+      bke::curves_copy_point_selection(src, kept, attribute_filter));
+  bke::curves_copy_parameters(src_id, *dst);
+  geometry.replace_curves(dst);
+  return true;
+}
+
+static bool apply_to_instances(GeometrySet &geometry,
+                               const MergedCommands &merged,
+                               const bke::AttributeFilter &attribute_filter,
+                               std::string &r_error)
+{
+  if (!merged.new_positions.is_empty() || !merged.new_prims.is_empty() ||
+      !merged.removed_prims.is_empty() || !merged.removed_curves.is_empty())
+  {
+    r_error = "Only remove_instance() changes instances";
+    return false;
+  }
+  bke::Instances &instances = *geometry.get_instances_for_write();
+  Array<bool> keep(instances.instances_num(), true);
+  for (const int i : merged.removed) {
+    keep[i] = false;
+  }
+  IndexMaskMemory memory;
+  instances.remove(IndexMask::from_bools(keep, memory), attribute_filter);
+  return true;
+}
+
 /** \} */
 
 /* -------------------------------------------------------------------- */
@@ -1356,35 +1601,21 @@ struct RunContext {
   bke::AttributeFilter attribute_filter;
 };
 
+using ComponentType = bke::GeometryComponent::Type;
+
 /**
- * Run the kernel over one real geometry: the points of the mesh (or the point cloud), the mesh's
- * faces, edges or corners, or once for the whole geometry.
+ * Run the kernel over one component of a geometry: the points of its mesh, point cloud or curves,
+ * the mesh's faces, edges or corners, the curves, the instances, or once for the whole geometry.
  */
-static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::string &r_error)
+static bool run_on_component(GeometrySet &geometry,
+                             const ComponentType type,
+                             const RunContext &run,
+                             std::string &r_error)
 {
   const Signature &sig = run.kernel->signature;
   const std::optional<AttrDomain> domain = run_domain(sig.run_over);
   const bool is_once = sig.run_over == "geometry";
-  bool is_mesh = false;
-  if (domain == AttrDomain::Point) {
-    is_mesh = geometry.has_mesh() && geometry.get_mesh()->verts_num > 0;
-    if (!is_mesh && !(geometry.has_pointcloud() && geometry.get_pointcloud()->totpoint > 0)) {
-      return true;
-    }
-  }
-  else if (domain) {
-    if (!geometry.has_mesh()) {
-      return true; /* Faces, edges and corners only exist on meshes. */
-    }
-    is_mesh = true;
-  }
-  else {
-    /* Geometry: runs once, also on empty geometry, which gets a mesh to build into. */
-    if (!geometry.has_mesh() && !geometry.has_pointcloud()) {
-      geometry.replace_mesh(BKE_mesh_new_nomain(0, 0, 0, 0));
-    }
-    is_mesh = geometry.has_mesh();
-  }
+  const bool is_mesh = type == ComponentType::Mesh;
 
   PointsSource input1_source;
   if (run.input1) {
@@ -1412,7 +1643,7 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
 
   /* Copies of input 0 that must not see the kernel's writes: snapshots, and positions for a
    * KD-tree on input 0. Made before any writer exists. */
-  const PointsSource input0_before = points_of(geometry);
+  const PointsSource input0_before = component_source(geometry, type);
   /* Surface queries on input 0 see it as it was before the run: a shared copy makes getting the
    * geometry for write below copy the mesh instead of changing this one. */
   std::optional<GeometrySet> input0_snapshot;
@@ -1421,6 +1652,7 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
   }
   const int64_t points_num = input0_before.size();
   const int64_t prims_num = input0_before.mesh ? input0_before.mesh->faces_num : 0;
+  const int64_t curves_num = input0_before.curves ? input0_before.curves->geometry.curve_num : 0;
   const int64_t domain_size = is_once ? 1 : input0_before.size(*domain);
   if (domain_size == 0) {
     return true;
@@ -1443,11 +1675,21 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
         selection.to_indices<int64_t>(selected_indices);
       }
     };
-    if (input0_before.mesh) {
-      evaluate(bke::MeshFieldContext(*input0_before.mesh, *domain));
-    }
-    else {
-      evaluate(bke::PointCloudFieldContext(*input0_before.pointcloud));
+    switch (type) {
+      case ComponentType::Mesh:
+        evaluate(bke::MeshFieldContext(*input0_before.mesh, *domain));
+        break;
+      case ComponentType::PointCloud:
+        evaluate(bke::PointCloudFieldContext(*input0_before.pointcloud));
+        break;
+      case ComponentType::Curve:
+        evaluate(bke::CurvesFieldContext(*input0_before.curves, *domain));
+        break;
+      case ComponentType::Instance:
+        evaluate(bke::InstancesFieldContext(*input0_before.instances));
+        break;
+      default:
+        return true;
     }
     if (run_size == 0) {
       return true;
@@ -1470,7 +1712,7 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
   host_data.npoints[0] = points_num;
   host_data.npoints[1] = input1_source.size();
   host_data.meshes[1] = input1_source.mesh;
-  std::array<bke::GAttributeReader, MAX_INPUTS> tree_readers;
+  std::array<VArray<float3>, MAX_INPUTS> tree_readers;
   std::array<Array<float3>, MAX_INPUTS> tree_copies;
   std::array<Span<float3>, MAX_INPUTS> tree_positions;
   for (const int input : sig.nearpoints_inputs) {
@@ -1481,23 +1723,38 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
     if (source.size() == 0) {
       continue;
     }
-    bke::GAttributeReader reader = source.attributes()->lookup("position", AttrDomain::Point);
-    if (input != 0 && reader.varray.is_span()) {
-      tree_positions[input] = reader.varray.get_internal_span().typed<float3>();
-      tree_readers[input] = std::move(reader);
+    VArray<float3> positions = source.positions();
+    if (input != 0 && positions.is_span()) {
+      tree_positions[input] = positions.get_internal_span();
+      tree_readers[input] = std::move(positions);
     }
     else {
       tree_copies[input] = Array<float3>(source.size());
-      array_utils::copy(reader.varray.typed<float3>(), tree_copies[input].as_mutable_span());
+      array_utils::copy(positions, tree_copies[input].as_mutable_span());
       tree_positions[input] = tree_copies[input];
     }
   }
 
   /* Writers on input 0. Getting the geometry for write un-shares it from Input 1. */
   Mesh *write_mesh = is_mesh ? geometry.get_mesh_for_write() : nullptr;
-  bke::MutableAttributeAccessor attributes = is_mesh ?
-                                                 write_mesh->attributes_for_write() :
-                                                 geometry.get_pointcloud_for_write()->attributes_for_write();
+  bke::Instances *write_instances = type == ComponentType::Instance ?
+                                        geometry.get_instances_for_write() :
+                                        nullptr;
+  bke::MutableAttributeAccessor attributes = [&]() {
+    switch (type) {
+      case ComponentType::PointCloud:
+        return geometry.get_pointcloud_for_write()->attributes_for_write();
+      case ComponentType::Curve:
+        return geometry.get_curves_for_write()->geometry.wrap().attributes_for_write();
+      case ComponentType::Instance:
+        return write_instances->attributes_for_write();
+      default:
+        return write_mesh->attributes_for_write();
+    }
+  }();
+  /* Instance positions are the translation of their transforms: the kernel writes a copy, set
+   * into the transforms after the run (after `@transform`, so the position wins). */
+  Array<float3, 0> instance_positions;
   Vector<bke::GSpanAttributeWriter> writers;
   /* `@color` is a vec3 in Toast and a float4 color in Blender: the kernel writes a vec3 copy that is
    * copied back into the color's RGB after the run, keeping alpha. */
@@ -1517,8 +1774,18 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
       continue;
     }
     const AttrType type = *attr_type_from_code(attr.type_code);
-    const std::string name = blender_name(attr.name, write_mesh);
+    const std::string name = blender_name(attr.name, write_mesh, attr.domain);
     const bool is_color = attr.name == "color" && type == AttrType::Float3;
+    if (name == "position" && attr.domain == AttrDomain::Instance && write_instances &&
+        type == AttrType::Float3)
+    {
+      instance_positions.reinitialize(write_instances->instances_num());
+      array_utils::copy(bke::instance_position_varray(*write_instances),
+                        instance_positions.as_mutable_span());
+      bindings[i] = {
+          instance_positions.data(), instance_positions.size(), attr.type_code, TOAST_DOMAIN_INSTANCE};
+      continue;
+    }
     const std::optional<bke::AttributeMetaData> meta = attributes.lookup_meta_data(name);
     if (name == "position" && attr.domain != AttrDomain::Point) {
       r_error =
@@ -1581,8 +1848,10 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
   /* Other reads, after the writers so they see the writable data: views where possible. Writes
    * only touch the written attributes' own arrays, and normals stay cached until the position
    * writer finishes after the run. */
-  const PointsSource input0 = points_of(geometry);
+  const PointsSource input0 = component_source(geometry, type);
   host_data.meshes[0] = input0.mesh;
+  host_data.curves[0] = input0.curves ? &input0.curves->geometry.wrap() : nullptr;
+  host_data.curves[1] = input1_source.curves ? &input1_source.curves->geometry.wrap() : nullptr;
   for (const int64_t i : sig.attrs.index_range()) {
     const SigAttr &attr = sig.attrs[i];
     if (is_written(attr)) {
@@ -1639,7 +1908,10 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
                     host_corner_face,
                     host_set_attr,
                     host_ray_cast,
-                    host_closest_point};
+                    host_closest_point,
+                    host_ncurves,
+                    host_curve_points,
+                    host_remove_curve};
 
   const int64_t chunks_num = (run_size + GRAIN_SIZE - 1) / GRAIN_SIZE;
   Array<CmdBuffer> buffers(chunks_num);
@@ -1683,22 +1955,78 @@ static bool run_on_geometry(GeometrySet &geometry, const RunContext &run, std::s
   for (bke::GSpanAttributeWriter &writer : writers) {
     writer.finish();
   }
+  if (!instance_positions.is_empty()) {
+    MutableSpan<float4x4> transforms = write_instances->transforms_for_write();
+    threading::parallel_for(transforms.index_range(), 4096, [&](const IndexRange range) {
+      for (const int64_t k : range) {
+        transforms[k].location() = instance_positions[k];
+      }
+    });
+  }
 
   if (!sig.uses_cmd) {
     return true;
   }
   MergedCommands merged;
-  if (!merge_commands(buffers, points_num, prims_num, merged, r_error)) {
+  if (!merge_commands(buffers, points_num, prims_num, curves_num, merged, r_error)) {
     return false;
   }
   if (!merged.has_changes()) {
     return true;
+  }
+  switch (type) {
+    case ComponentType::Curve:
+      return apply_to_curves(geometry, merged, run.attribute_filter, r_error);
+    case ComponentType::Instance:
+      return apply_to_instances(geometry, merged, run.attribute_filter, r_error);
+    default:
+      break;
+  }
+  if (!merged.removed_curves.is_empty()) {
+    r_error = "remove_curve() needs curves, the code ran on a mesh or point cloud";
+    return false;
   }
   if (is_mesh) {
     apply_to_mesh(geometry, merged, run.attribute_filter);
     return true;
   }
   return apply_to_pointcloud(geometry, merged, run.attribute_filter, r_error);
+}
+
+/** The components of one real geometry the kernel runs on, by Run Over. */
+static Vector<ComponentType> components_to_run(GeometrySet &geometry, const StringRef run_over)
+{
+  Vector<ComponentType> types;
+  const Mesh *mesh = geometry.get_mesh();
+  const PointCloud *pointcloud = geometry.get_pointcloud();
+  const Curves *curves = geometry.get_curves();
+  if (run_over == "points") {
+    if (mesh && mesh->verts_num > 0) {
+      types.append(ComponentType::Mesh);
+    }
+    if (pointcloud && pointcloud->totpoint > 0) {
+      types.append(ComponentType::PointCloud);
+    }
+    if (curves && curves->geometry.point_num > 0) {
+      types.append(ComponentType::Curve);
+    }
+  }
+  else if (run_over == "curves") {
+    if (curves && curves->geometry.curve_num > 0) {
+      types.append(ComponentType::Curve);
+    }
+  }
+  else if (run_over == "geometry") {
+    /* Runs once, also on empty geometry, which gets a mesh to build into. */
+    if (!mesh && !pointcloud) {
+      geometry.replace_mesh(BKE_mesh_new_nomain(0, 0, 0, 0));
+    }
+    types.append(geometry.has_mesh() ? ComponentType::Mesh : ComponentType::PointCloud);
+  }
+  else if (mesh) {
+    types.append(ComponentType::Mesh); /* Faces, edges and corners. */
+  }
+  return types;
 }
 
 static const bNodeSocket *find_input(const bNode &node, const StringRef identifier)
@@ -1812,13 +2140,26 @@ static void node_geo_exec(GeoNodeExecParams params)
     run.time = scene ? float(run.frame / scene->frames_per_second()) : 0.0f;
   }
 
+  const StringRef run_over = kernel->signature.run_over;
+  if (run_over == "instances") {
+    /* The instances of the top-level geometry, like Blender's instance nodes. */
+    const bke::Instances *instances = geometry.get_instances();
+    if (instances && instances->instances_num() > 0) {
+      run_on_component(geometry, ComponentType::Instance, run, error);
+    }
+    finish(error.empty() ? std::nullopt : std::optional<std::string>(error));
+    return;
+  }
   std::mutex error_mutex;
   geometry::foreach_real_geometry(geometry, [&](GeometrySet &real_geometry) {
-    std::string local_error;
-    if (!run_on_geometry(real_geometry, run, local_error)) {
-      std::lock_guard lock{error_mutex};
-      if (error.empty()) {
-        error = local_error;
+    for (const ComponentType type : components_to_run(real_geometry, run_over)) {
+      std::string local_error;
+      if (!run_on_component(real_geometry, type, run, local_error)) {
+        std::lock_guard lock{error_mutex};
+        if (error.empty()) {
+          error = local_error;
+        }
+        return;
       }
     }
   });
