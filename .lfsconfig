@@ -1,0 +1,4 @@
+# Toast fork: Git LFS files are Blender's own; fetch them from Blender's server (GitHub does
+# not store LFS objects for public forks).
+[lfs]
+	url = https://projects.blender.org/blender/blender.git/info/lfs
