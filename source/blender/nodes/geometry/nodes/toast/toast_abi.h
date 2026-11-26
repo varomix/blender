@@ -15,7 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#define TOAST_ABI_VERSION 9
+#define TOAST_ABI_VERSION 10
 
 extern "C" {
 

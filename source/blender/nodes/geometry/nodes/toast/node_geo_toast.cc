@@ -245,6 +245,8 @@ struct SigGrid {
   std::string name;
   int input = 0;
   bool vector = false;
+  /** voxel_at(): only the grid's transform is used, any type will do. */
+  bool any = false;
 };
 
 struct SigParam {
@@ -269,6 +271,8 @@ struct Signature {
   /* add_curve()/extend_curve(): Run Over Geometry runs on curves, made if there are none. */
   bool builds_curves = false;
   bool uses_neighbors = false;
+  /* activate_voxel()/deactivate_voxel(). */
+  bool uses_voxel_cmd = false;
   Vector<int> nearpoints_inputs;
   Vector<int> surface_inputs;
 };
@@ -393,6 +397,7 @@ static std::optional<Signature> parse_signature(const StringRefNull json_str)
       grid.name = std::string(g->lookup_str("name").value_or(""));
       grid.input = int(g->lookup_int("input").value_or(0));
       grid.vector = g->lookup_str("type").value_or("float") == "vec3";
+      grid.any = g->lookup_str("type").value_or("float") == "any";
       sig.grids.append(std::move(grid));
     }
   }
@@ -405,6 +410,7 @@ static std::optional<Signature> parse_signature(const StringRefNull json_str)
       for (const std::shared_ptr<io::serialize::Value> &c : host->elements()) {
         if (const io::serialize::StringValue *v = c->as_string_value()) {
           sig.uses_neighbors |= v->value() == "point_neighbors";
+          sig.uses_voxel_cmd |= v->value() == "voxel_cmd";
         }
       }
     }
@@ -923,6 +929,20 @@ static int32_t host_grid_sample(
   }
   const GridSlot &slot = host.grids[grid];
   const float3 p(pos3[0], pos3[1], pos3[2]);
+  if (mode == 3) {
+    /* The nearest voxel's index. */
+    const float4x4 &m = slot.to_index;
+    const float x = m[0][0] * p.x + m[1][0] * p.y + m[2][0] * p.z + m[3][0];
+    const float y = m[0][1] * p.x + m[1][1] * p.y + m[2][1] * p.z + m[3][1];
+    const float z = m[0][2] * p.x + m[1][2] * p.y + m[2][2] * p.z + m[3][2];
+    if (!(std::abs(x) < 1e9f && std::abs(y) < 1e9f && std::abs(z) < 1e9f)) {
+      return 0;
+    }
+    out[0] = std::floor(x + 0.5f);
+    out[1] = std::floor(y + 0.5f);
+    out[2] = std::floor(z + 0.5f);
+    return 1;
+  }
   if (mode == 2) {
     /* The voxel at index p, rounded: the trilinear read at a whole index reads only it. */
     float3 value = slot.background;
@@ -2995,7 +3015,7 @@ static void find_grid_slots(const Signature &sig,
       continue;
     }
     const VolumeGridType type = grid->grid_type();
-    if (!is_toast_grid_type(type) || is_vector_grid_type(type) != want.vector) {
+    if (!is_toast_grid_type(type) || (!want.any && is_vector_grid_type(type) != want.vector)) {
       if (warnings) {
         warnings->add("sample_grid(): grid \"" + want.name + "\" isn't a " +
                       (want.vector ? "vector" : "float") +
@@ -3276,6 +3296,68 @@ static bool run_on_volume(GeometrySet &geometry, const RunContext &run, std::str
       bke::SpanAttributeWriter<float3> writer =
           attributes.lookup_or_add_for_write_only_span<float3>(attr.name, AttrDomain::Point);
       writer.span.fill(size);
+      writer.finish();
+    }
+  }
+  /* grid_voxel() fast path: copies of grids on the voxels, read at each voxel's index in the
+   * grid's own index space (as grid_voxel() reads), and face neighbor tables, as the harness. */
+  std::optional<openvdb::Int32Tree> numbers;
+  for (const SigAttr &attr : sig.attrs) {
+    const StringRef name = attr.name;
+    if (attr.input != 0 || attributes.contains(name)) {
+      continue;
+    }
+    if (name.startswith("__grid_")) {
+      const bool vector = attr.type_code == TOAST_TYPE_FLOAT3;
+      bke::GSpanAttributeWriter writer = attributes.lookup_or_add_for_write_span(
+          name, AttrDomain::Point, vector ? AttrType::Float3 : AttrType::Float);
+      const bke::VolumeGridData *grid = BKE_volume_grid_find(volume, name.drop_prefix(7));
+      if (grid && is_toast_grid_type(grid->grid_type()) &&
+          is_vector_grid_type(grid->grid_type()) == vector)
+      {
+        bke::VolumeTreeAccessToken token;
+        const openvdb::GridBase &base = grid->grid(token);
+        with_toast_grid_type(grid->grid_type(), [&]<typename GridT>() {
+          const GridT &typed = static_cast<const GridT &>(base);
+          foreach_leaf([&](const MaskLeaf &leaf, int64_t k) {
+            auto accessor = typed.getConstUnsafeAccessor();
+            for (auto it = leaf.cbeginValueOn(); it; ++it, ++k) {
+              const float3 v = voxel_to_float3(accessor.getValue(it.getCoord()));
+              if (vector) {
+                writer.span.typed<float3>()[k] = v;
+              }
+              else {
+                writer.span.typed<float>()[k] = v.x;
+              }
+            }
+          });
+        });
+      }
+      writer.finish();
+    }
+    else if (name.size() == 4 && name.startswith("__n") && name[3] >= '0' && name[3] <= '5') {
+      if (!numbers) {
+        /* Each voxel's number, -1 elsewhere. */
+        numbers.emplace(-1);
+        numbers->topologyUnion(mask);
+        foreach_leaf([&](const MaskLeaf &leaf, int64_t k) {
+          openvdb::Int32Tree::LeafNodeType *target = numbers->probeLeaf(leaf.origin());
+          for (auto it = leaf.cbeginValueOn(); it; ++it, ++k) {
+            target->setValueOnly(it.pos(), int32_t(k));
+          }
+        });
+      }
+      static const int3 steps[6] = {
+          {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+      const int3 d = steps[name[3] - '0'];
+      bke::SpanAttributeWriter<int> writer = attributes.lookup_or_add_for_write_only_span<int>(
+          name, AttrDomain::Point);
+      foreach_leaf([&](const MaskLeaf &leaf, int64_t k) {
+        auto accessor = numbers->getConstUnsafeAccessor();
+        for (auto it = leaf.cbeginValueOn(); it; ++it, ++k) {
+          writer.span[k] = accessor.getValue(it.getCoord().offsetBy(d.x, d.y, d.z));
+        }
+      });
       writer.finish();
     }
   }
@@ -3594,7 +3676,27 @@ static void node_geo_exec(GeoNodeExecParams params)
     return;
   }
   std::mutex error_mutex;
-  geometry::foreach_real_geometry(geometry, [&](GeometrySet &real_geometry) {
+  geometry::foreach_real_geometry(geometry, [&](GeometrySet &real_geometry_ref) {
+    GeometrySet &real_geometry = real_geometry_ref;
+#ifdef WITH_OPENVDB
+    /* activate_voxel()/deactivate_voxel() outside Run Over Voxels: collected over this
+     * geometry's components, then applied to its volume (see below). */
+    RunContext run_here = run;
+    VoxelCommands voxel_cmds;
+    if (kernel->signature.uses_voxel_cmd && run_over != "voxels") {
+      run_here.voxel_cmds = &voxel_cmds;
+    }
+    const RunContext &run = run_here;
+    BLI_SCOPED_DEFER([&]() {
+      if (run_here.voxel_cmds && real_geometry.has_volume()) {
+        Volume *volume = real_geometry.get_volume_for_write();
+        if (BKE_volume_num_grids(volume) > 0) {
+          const float4x4 matrix = grid_matrix(BKE_volume_grid_get(volume, 0)->transform());
+          apply_voxel_commands(*volume, matrix, voxel_cmds);
+        }
+      }
+    });
+#endif
     if (run_over == "voxels") {
 #ifdef WITH_OPENVDB
       std::string local_error;
