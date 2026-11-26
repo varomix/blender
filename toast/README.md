@@ -11,6 +11,7 @@ fork for each Blender release, as a short series of commits on top of Blender's 
 - `source/blender/nodes/geometry/nodes/toast/`: the Toast node, the plugin loader and the
   plugins; its `README.md` lists everything the fork changes.
 - `toast/addon/docs/guide.md`: how to write Toast code.
+- `toast/addon/docs/building.md`: building this fork on Linux and macOS, and running the tests.
 
 ## Building
 
