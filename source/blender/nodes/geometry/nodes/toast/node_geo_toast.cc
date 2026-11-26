@@ -851,14 +851,28 @@ static void host_set_attr(void *self,
 }
 
 /**
- * Apply set_point_attr()/set_face_attr() into the bound arrays, in (source index, emission order):
- * chunks cover increasing ranges, so that is chunk order. Done before topology changes.
+ * A set_point_attr() on a point added in this run: a handle from add_point(), or an index from
+ * the input's point count on (the new points in merged order).
  */
-static bool apply_sets(Span<CmdBuffer> buffers, Span<ToastAttr> bindings, std::string &r_error)
+static bool is_new_point_set(const Cmd &cmd, Span<ToastAttr> bindings, Span<SigAttr> sig_attrs)
+{
+  return sig_attrs[cmd.attr].domain == AttrDomain::Point &&
+         (cmd.point < 0 || cmd.point >= bindings[cmd.attr].size);
+}
+
+/**
+ * Apply set_point_attr()/set_face_attr() into the bound arrays, in (source index, emission order):
+ * chunks cover increasing ranges, so that is chunk order. Done before topology changes. Writes to
+ * points added in this run wait for the points, see #apply_new_point_sets.
+ */
+static bool apply_sets(Span<CmdBuffer> buffers,
+                       Span<ToastAttr> bindings,
+                       Span<SigAttr> sig_attrs,
+                       std::string &r_error)
 {
   for (const CmdBuffer &buffer : buffers) {
     for (const Cmd &cmd : buffer.cmds) {
-      if (cmd.kind != CmdKind::SetAttr) {
+      if (cmd.kind != CmdKind::SetAttr || is_new_point_set(cmd, bindings, sig_attrs)) {
         continue;
       }
       const ToastAttr &attr = bindings[cmd.attr];
@@ -1301,12 +1315,21 @@ static bool read_attribute(const PointsSource &source,
 /** \name Applying Commands
  * \{ */
 
+/** set_point_attr() on a point added in this run: binding `attr`, bytes in #MergedCommands. */
+struct NewPointSet {
+  int point;
+  int attr;
+  IndexRange value;
+};
+
 struct MergedCommands {
   Vector<float3> new_positions;
   Vector<Vector<int>> new_prims;
   Vector<int> removed;
   Vector<int> removed_prims;
   Vector<int> removed_curves;
+  Vector<NewPointSet> new_point_sets;
+  Vector<uint8_t> new_point_values;
   bool has_changes() const
   {
     return !new_positions.is_empty() || !new_prims.is_empty() || !removed.is_empty() ||
@@ -1319,6 +1342,8 @@ struct MergedCommands {
  * chunk are in element order, so chunk order is already (source index, emission order).
  */
 static bool merge_commands(Span<CmdBuffer> buffers,
+                           Span<ToastAttr> bindings,
+                           Span<SigAttr> sig_attrs,
                            const int64_t points_num,
                            const int64_t prims_num,
                            const int64_t curves_num,
@@ -1374,8 +1399,19 @@ static bool merge_commands(Span<CmdBuffer> buffers,
           r_merged.new_prims.append(std::move(prim));
           break;
         }
-        case CmdKind::SetAttr:
-          break; /* Applied before the merge, see apply_sets. */
+        case CmdKind::SetAttr: {
+          /* Others were applied before the merge, see apply_sets. */
+          if (is_new_point_set(cmd, bindings, sig_attrs)) {
+            int index;
+            if (!resolve(cmd.point, index)) {
+              return false;
+            }
+            const IndexRange value(r_merged.new_point_values.size(), cmd.value.size());
+            r_merged.new_point_values.extend(buffer.values.as_span().slice(cmd.value));
+            r_merged.new_point_sets.append({index, cmd.attr, value});
+          }
+          break;
+        }
         case CmdKind::RemovePrim: {
           if (cmd.point < 0 || cmd.point >= prims_num) {
             r_error = "Face " + std::to_string(cmd.point) + " does not exist";
@@ -1426,6 +1462,18 @@ static void grow_domain(const bke::AttributeAccessor src_attributes,
     array_utils::fill_index_range<int>(indices.as_mutable_span().take_front(old_num));
     bke::gather_attributes(
         src_attributes, domain, domain, attribute_filter, indices.as_span(), dst_attributes);
+  }
+  else {
+    /* Nothing to copy, but keep the attributes: on an empty input (Run Over Geometry building
+     * from nothing) they are the ones the code created, and set_point_attr() writes into. */
+    src_attributes.foreach_attribute([&](const bke::AttributeIter &iter) {
+      if (iter.domain != domain || iter.data_type == bke::AttrType::String ||
+          attribute_filter.allow_skip(iter.name))
+      {
+        return;
+      }
+      dst_attributes.add(iter.name, domain, iter.data_type, bke::AttributeInitDefaultValue());
+    });
   }
   if (added > 0) {
     bke::fill_attribute_range_default(
@@ -1498,14 +1546,56 @@ static Mesh *mesh_add_elements(const Mesh &src,
   return dst;
 }
 
-static void apply_to_mesh(GeometrySet &geometry,
+/**
+ * Write set_point_attr() values to points added in this run, once they exist and before
+ * removals: in merged order, so the last write wins, like #apply_sets.
+ */
+static bool apply_new_point_sets(bke::MutableAttributeAccessor attributes,
+                                 const MergedCommands &merged,
+                                 Span<SigAttr> sig_attrs,
+                                 std::string &r_error)
+{
+  if (merged.new_point_sets.is_empty()) {
+    return true;
+  }
+  Map<int, bke::GSpanAttributeWriter> writers;
+  bool ok = true;
+  for (const NewPointSet &set : merged.new_point_sets) {
+    const SigAttr &attr = sig_attrs[set.attr];
+    bke::GSpanAttributeWriter &writer = writers.lookup_or_add_cb(
+        set.attr, [&]() { return attributes.lookup_for_write_span(attr.name); });
+    if (!writer || writer.domain != AttrDomain::Point ||
+        writer.span.type().size != int64_t(set.value.size()) || set.point >= writer.span.size())
+    {
+      r_error = "set_point_attr(): '" + attr.name + "' can't be written on points added in this run";
+      ok = false;
+      break;
+    }
+    memcpy(writer.span[set.point], &merged.new_point_values[set.value.start()], set.value.size());
+  }
+  for (bke::GSpanAttributeWriter &writer : writers.values()) {
+    if (writer) {
+      writer.finish();
+    }
+  }
+  return ok;
+}
+
+static bool apply_to_mesh(GeometrySet &geometry,
                           const MergedCommands &merged,
-                          const bke::AttributeFilter &attribute_filter)
+                          Span<SigAttr> sig_attrs,
+                          const bke::AttributeFilter &attribute_filter,
+                          std::string &r_error)
 {
   const Mesh *mesh = geometry.get_mesh();
   if (!merged.new_positions.is_empty() || !merged.new_prims.is_empty()) {
     geometry.replace_mesh(mesh_add_elements(*mesh, merged, attribute_filter));
     mesh = geometry.get_mesh();
+    if (!apply_new_point_sets(
+            geometry.get_mesh_for_write()->attributes_for_write(), merged, sig_attrs, r_error))
+    {
+      return false;
+    }
   }
   if (!merged.removed_prims.is_empty()) {
     /* Faces only, keeping their points and edges (Delete Geometry, Only Faces). */
@@ -1531,10 +1621,12 @@ static void apply_to_mesh(GeometrySet &geometry,
       geometry.replace_mesh(*result);
     }
   }
+  return true;
 }
 
 static bool apply_to_pointcloud(GeometrySet &geometry,
                                 const MergedCommands &merged,
+                                Span<SigAttr> sig_attrs,
                                 const bke::AttributeFilter &attribute_filter,
                                 std::string &r_error)
 {
@@ -1547,6 +1639,9 @@ static bool apply_to_pointcloud(GeometrySet &geometry,
   if (!merged.new_positions.is_empty()) {
     pointcloud_resize(*pointcloud, old_num + merged.new_positions.size());
     pointcloud->positions_for_write().drop_front(old_num).copy_from(merged.new_positions);
+    if (!apply_new_point_sets(pointcloud->attributes_for_write(), merged, sig_attrs, r_error)) {
+      return false;
+    }
   }
   if (!merged.removed.is_empty()) {
     Array<bool> keep(pointcloud->totpoint, true);
@@ -1998,7 +2093,7 @@ static bool run_on_component(GeometrySet &geometry,
     }
   });
 
-  if (sig.uses_cmd && !apply_sets(buffers, bindings, r_error)) {
+  if (sig.uses_cmd && !apply_sets(buffers, bindings, sig.attrs, r_error)) {
     for (bke::GSpanAttributeWriter &writer : writers) {
       writer.finish();
     }
@@ -2030,7 +2125,9 @@ static bool run_on_component(GeometrySet &geometry,
     return true;
   }
   MergedCommands merged;
-  if (!merge_commands(buffers, points_num, prims_num, curves_num, merged, r_error)) {
+  if (!merge_commands(
+          buffers, bindings, sig.attrs, points_num, prims_num, curves_num, merged, r_error))
+  {
     return false;
   }
   if (!merged.has_changes()) {
@@ -2049,10 +2146,9 @@ static bool run_on_component(GeometrySet &geometry,
     return false;
   }
   if (is_mesh) {
-    apply_to_mesh(geometry, merged, run.attribute_filter);
-    return true;
+    return apply_to_mesh(geometry, merged, sig.attrs, run.attribute_filter, r_error);
   }
-  return apply_to_pointcloud(geometry, merged, run.attribute_filter, r_error);
+  return apply_to_pointcloud(geometry, merged, sig.attrs, run.attribute_filter, r_error);
 }
 
 /** The components of one real geometry the kernel runs on, by Run Over. */

@@ -45,8 +45,8 @@ mkdir -p "$VERSION_DIR/scripts/addons_core"
 rm -rf "$VERSION_DIR/scripts/addons_core/toast"  # A development install may be a symbolic link.
 rsync -a --exclude '__pycache__' "$TOAST_ADDON_DIR/toast/" "$VERSION_DIR/scripts/addons_core/toast/"
 cp "$TOAST_ADDON_DIR/docs/guide.md" "$STAGE/$NAME/TOAST_GUIDE.md"
-if [ -f "$TOAST_ADDON_DIR/docs/guide.html" ]; then
-  cp "$TOAST_ADDON_DIR/docs/guide.html" "$STAGE/$NAME/TOAST_GUIDE.html"
+if [ -f "$TOAST_ADDON_DIR/toast/guide.html" ]; then
+  cp "$TOAST_ADDON_DIR/toast/guide.html" "$STAGE/$NAME/TOAST_GUIDE.html"
 fi
 # The built-in kernel compiler carries clang and LLVM: drop its symbol tables.
 if [ -f "$STAGE/$NAME/lib/libtoast_jit.so" ]; then
