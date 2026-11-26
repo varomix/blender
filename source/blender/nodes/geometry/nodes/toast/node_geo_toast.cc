@@ -58,6 +58,7 @@
 #include "BKE_instances.hh"
 #include "BKE_lib_id.hh"
 #include "BKE_mesh.hh"
+#include "BKE_mesh_mapping.hh"
 #include "BKE_pointcloud.hh"
 
 #include "BLO_read_write.hh"
@@ -638,8 +639,7 @@ struct HostData {
   /* For face queries; null for inputs without a mesh. */
   std::array<const Mesh *, MAX_INPUTS> meshes = {};
   /* Points sharing an edge with each point, ascending (built when the code uses them). */
-  std::array<Array<int>, MAX_INPUTS> neighbor_offsets;
-  std::array<Array<int>, MAX_INPUTS> neighbors;
+  std::array<std::shared_ptr<const struct NeighborTable>, MAX_INPUTS> neighbors;
   /* Bytes per element of each bound attribute, for cmd_set_attr. */
   Span<ToastAttr> bindings;
   /* Meshes for ray_cast/closest_point, as they were before the run. */
@@ -747,26 +747,109 @@ static int64_t type_size(const int32_t type_code)
   return 0;
 }
 
-static void build_neighbors(const Mesh &mesh, Array<int> &r_offsets, Array<int> &r_neighbors)
+/** Points sharing an edge with each point of a mesh, ascending: for point_neighbors(). */
+struct NeighborTable {
+  Array<int> offsets;
+  Array<int> neighbors;
+};
+
+static std::shared_ptr<const NeighborTable> build_neighbor_table(const Mesh &mesh)
 {
+  auto table = std::make_shared<NeighborTable>();
   const Span<int2> edges = mesh.edges();
-  r_offsets = Array<int>(mesh.verts_num + 1, 0);
-  for (const int2 e : edges) {
-    r_offsets[e[0]]++;
-    r_offsets[e[1]]++;
-  }
-  offset_indices::accumulate_counts_to_offsets(r_offsets);
-  r_neighbors = Array<int>(r_offsets.last());
-  Array<int> fill(mesh.verts_num, 0);
-  for (const int2 e : edges) {
-    r_neighbors[r_offsets[e[0]] + fill[e[0]]++] = e[1];
-    r_neighbors[r_offsets[e[1]] + fill[e[1]]++] = e[0];
-  }
-  threading::parallel_for(IndexRange(mesh.verts_num), 4096, [&](const IndexRange range) {
+  Array<int> edge_indices;
+  bke::mesh::build_vert_to_edge_map(edges, mesh.verts_num, table->offsets, edge_indices);
+  const OffsetIndices<int> offsets(table->offsets);
+  table->neighbors.reinitialize(edge_indices.size());
+  threading::parallel_for(IndexRange(mesh.verts_num), 2048, [&](const IndexRange range) {
     for (const int v : range) {
-      std::sort(&r_neighbors[r_offsets[v]], &r_neighbors[r_offsets[v + 1]]);
+      const IndexRange group = offsets[v];
+      MutableSpan<int> out = table->neighbors.as_mutable_span().slice(group);
+      for (const int k : group.index_range()) {
+        const int2 e = edges[edge_indices[group[k]]];
+        out[k] = e[0] == v ? e[1] : e[0];
+      }
+      std::sort(out.begin(), out.end());
     }
   });
+  return table;
+}
+
+/**
+ * Neighbor tables of recent meshes, by their edges. Code that runs again on the same topology
+ * (every step of a Repeat Zone, every frame of a simulation that only moves points) reuses the
+ * table. Entries hold a weak user of the edges' sharing info: it doesn't keep the edges alive,
+ * and an entry matches only while they exist and haven't changed (same version).
+ */
+static std::shared_ptr<const NeighborTable> neighbor_table(const Mesh &mesh)
+{
+  const bke::GAttributeReader edges = mesh.attributes().lookup(".edge_verts");
+  if (!edges || edges.sharing_info == nullptr) {
+    return build_neighbor_table(mesh);
+  }
+  struct Entry {
+    const ImplicitSharingInfo *edges = nullptr;
+    int64_t version = 0;
+    int verts_num = 0;
+    std::shared_ptr<const NeighborTable> table;
+    Entry(const ImplicitSharingInfo *edges,
+          const int64_t version,
+          const int verts_num,
+          std::shared_ptr<const NeighborTable> table)
+        : edges(edges), version(version), verts_num(verts_num), table(std::move(table))
+    {
+      edges->add_weak_user();
+    }
+    Entry(Entry &&other) noexcept
+        : edges(std::exchange(other.edges, nullptr)),
+          version(other.version),
+          verts_num(other.verts_num),
+          table(std::move(other.table))
+    {
+    }
+    Entry &operator=(Entry &&other) noexcept
+    {
+      if (this != &other) {
+        this->~Entry();
+        new (this) Entry(std::move(other));
+      }
+      return *this;
+    }
+    ~Entry()
+    {
+      if (edges) {
+        edges->remove_weak_user_and_delete_if_last();
+      }
+    }
+    bool matches(const ImplicitSharingInfo *info, const int verts) const
+    {
+      return edges == info && !edges->is_expired() && edges->version() == version &&
+             verts_num == verts;
+    }
+  };
+  static std::mutex mutex;
+  static Vector<Entry> cache; /* Most recently used last. */
+  constexpr int64_t cache_size = 4;
+  {
+    std::lock_guard lock{mutex};
+    for (const int64_t i : cache.index_range()) {
+      if (cache[i].matches(edges.sharing_info, mesh.verts_num)) {
+        Entry entry = std::move(cache[i]);
+        cache.remove(i);
+        std::shared_ptr<const NeighborTable> table = entry.table;
+        cache.append(std::move(entry));
+        return table;
+      }
+    }
+  }
+  const int64_t version = edges.sharing_info->version();
+  std::shared_ptr<const NeighborTable> table = build_neighbor_table(mesh);
+  std::lock_guard lock{mutex};
+  if (cache.size() >= cache_size) {
+    cache.remove(0);
+  }
+  cache.append(Entry(edges.sharing_info, version, mesh.verts_num, table));
+  return table;
 }
 
 static int32_t write_indices(const Span<int> values, const int32_t max, int64_t *out)
@@ -796,17 +879,16 @@ static int32_t host_point_neighbors(
     void *self, const int32_t input, const int64_t point, const int32_t max, int64_t *out)
 {
   const HostData &host = *static_cast<const HostData *>(self);
-  if (input < 0 || input >= MAX_INPUTS || host.neighbor_offsets[input].is_empty()) {
+  if (input < 0 || input >= MAX_INPUTS || !host.neighbors[input]) {
     return 0;
   }
-  const Span<int> offsets = host.neighbor_offsets[input];
-  if (point < 0 || point >= offsets.size() - 1) {
+  const NeighborTable &table = *host.neighbors[input];
+  if (point < 0 || point >= table.offsets.size() - 1) {
     return 0;
   }
-  return write_indices(
-      host.neighbors[input].as_span().slice(offsets[point], offsets[point + 1] - offsets[point]),
-      max,
-      out);
+  return write_indices(table.neighbors.as_span().slice(OffsetIndices<int>(table.offsets)[point]),
+                       max,
+                       out);
 }
 
 static int64_t host_corner_point(void *self, const int32_t input, const int64_t corner)
@@ -2144,9 +2226,7 @@ static bool run_on_component(GeometrySet &geometry,
   if (sig.uses_neighbors) {
     for (const int input : IndexRange(MAX_INPUTS)) {
       if (host_data.meshes[input]) {
-        build_neighbors(*host_data.meshes[input],
-                        host_data.neighbor_offsets[input],
-                        host_data.neighbors[input]);
+        host_data.neighbors[input] = neighbor_table(*host_data.meshes[input]);
       }
     }
   }
