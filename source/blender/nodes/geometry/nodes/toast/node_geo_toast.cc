@@ -657,6 +657,9 @@ struct HostData {
   Span<ToastAttr> bindings;
   /* Meshes for ray_cast/closest_point, as they were before the run. */
   std::array<const Mesh *, MAX_INPUTS> surface_meshes = {};
+  /* surface_point(): cumulative triangle areas of each surface mesh, built on first use. */
+  mutable std::array<std::once_flag, MAX_INPUTS> area_cdf_once;
+  mutable std::array<Array<double>, MAX_INPUTS> area_cdf;
   /* For curve queries; null for inputs without curves. */
   std::array<const bke::CurvesGeometry *, MAX_INPUTS> curves = {};
 };
@@ -737,6 +740,60 @@ static int32_t host_closest_point(
                   result->bary_coord,
                   math::distance(position, result->position),
                   out);
+}
+
+/**
+ * A point on the triangles of an input's mesh, area weighted, as the harness does it: `u` picks
+ * the triangle by cumulative (twice) area, summed in double in triangle order; `v` and `w` are its
+ * barycentric weights for the second and third corner, folded back when v + w > 1.
+ */
+static int32_t host_surface_point(
+    void *self, const int32_t input, const float u, float v, float w, ToastHit *out)
+{
+  const HostData &host = *static_cast<const HostData *>(self);
+  if (input < 0 || input >= MAX_INPUTS || host.surface_meshes[input] == nullptr) {
+    return 0;
+  }
+  const Mesh &mesh = *host.surface_meshes[input];
+  const Span<int3> tris = mesh.corner_tris();
+  const Span<int> corner_verts = mesh.corner_verts();
+  const Span<float3> positions = mesh.vert_positions();
+  std::call_once(host.area_cdf_once[input], [&]() {
+    Array<double> cdf(tris.size());
+    double total = 0.0;
+    for (const int64_t k : tris.index_range()) {
+      const float3 &a = positions[corner_verts[tris[k][0]]];
+      const float3 &b = positions[corner_verts[tris[k][1]]];
+      const float3 &c = positions[corner_verts[tris[k][2]]];
+      const double e1x = double(b.x) - double(a.x), e1y = double(b.y) - double(a.y),
+                   e1z = double(b.z) - double(a.z);
+      const double e2x = double(c.x) - double(a.x), e2y = double(c.y) - double(a.y),
+                   e2z = double(c.z) - double(a.z);
+      const double cx = e1y * e2z - e1z * e2y;
+      const double cy = e1z * e2x - e1x * e2z;
+      const double cz = e1x * e2y - e1y * e2x;
+      total += std::sqrt(cx * cx + cy * cy + cz * cz);
+      cdf[k] = total;
+    }
+    host.area_cdf[input] = std::move(cdf);
+  });
+  const Span<double> cdf = host.area_cdf[input];
+  if (cdf.is_empty() || !(cdf.last() > 0.0)) {
+    return 0;
+  }
+  const double target = double(u) * cdf.last();
+  const int tri = std::min<int>(
+      std::upper_bound(cdf.begin(), cdf.end(), target) - cdf.begin(), int(cdf.size()) - 1);
+  if (v + w > 1.0f) {
+    v = 1.0f - v;
+    w = 1.0f - w;
+  }
+  const float b0 = 1.0f - v - w;
+  const float3 &a = positions[corner_verts[tris[tri][0]]];
+  const float3 &b = positions[corner_verts[tris[tri][1]]];
+  const float3 &c = positions[corner_verts[tris[tri][2]]];
+  const float3 position = a * b0 + b * v + c * w;
+  return fill_hit(mesh, tri, position, float3(b0, v, w), 0.0f, out);
 }
 
 static int64_t type_size(const int32_t type_code)
@@ -2477,7 +2534,8 @@ static bool run_on_component(GeometrySet &geometry,
                     host_curve_points,
                     host_remove_curve,
                     host_add_curve,
-                    host_extend_curve};
+                    host_extend_curve,
+                    host_surface_point};
 
   const int64_t chunks_num = (run_size + GRAIN_SIZE - 1) / GRAIN_SIZE;
   Array<CmdBuffer> buffers(chunks_num);
