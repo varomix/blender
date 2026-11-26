@@ -1084,6 +1084,8 @@ if(WITH_BLENDER)
 
     # Images.
     data_to_c_simple(../../../../release/datafiles/splash.png SRC)
+    # Toast fork: badge drawn over the splash.
+    data_to_c_simple(../../../../release/datafiles/toast_splash_badge.png SRC)
 
     unset(SVG_CONTENTS_H)
     unset(SVG_CONTENTS_C)

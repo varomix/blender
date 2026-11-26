@@ -14,6 +14,7 @@
  * - Links to web sites.
  */
 
+#include <algorithm>
 #include <cstring>
 
 #include "DNA_screen_types.h"
@@ -173,6 +174,49 @@ static void wm_project_splash_logo_add(ImBuf *ibuf)
 
   IMB_freeImBuf(logo);
 }
+
+/* Toast fork: the Toast icon, small, in the top right corner of the splash (mirroring the Blender
+ * logo on the left), so this build is easy to tell apart from an official one. */
+static void wm_toast_splash_badge_add(ImBuf *ibuf)
+{
+  ImBuf *badge = IMB_load_image_from_memory(
+      reinterpret_cast<const uchar *>(datatoc_toast_splash_badge_png),
+      size_t(datatoc_toast_splash_badge_png_size),
+      ImBufFlags::ByteData,
+      "<toast splash badge>");
+  if (badge == nullptr) {
+    return;
+  }
+  const int size = std::max(int(ibuf->x * 0.11f), 1);
+  IMB_scale(badge, size, size, IMBScaleFilter::Box, false);
+
+  /* Rows are stored bottom to top. Below the version number Blender draws in this corner. */
+  const int margin = int(ibuf->x * 0.025f);
+  const int x = ibuf->x - margin - badge->x;
+  const int y = ibuf->y - int(ibuf->x * 0.055f) - badge->y;
+  if (x >= 0 && y >= 0) {
+    IMB_rectblend(ibuf,
+                  ibuf->byte_data_for_write(),
+                  nullptr,
+                  ibuf,
+                  badge,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  0.0f,
+                  x,
+                  y,
+                  x,
+                  y,
+                  0,
+                  0,
+                  badge->x,
+                  badge->y,
+                  IMB_BLEND_MIX,
+                  false);
+  }
+  IMB_freeImBuf(badge);
+}
 #endif /* !WITH_HEADLESS */
 
 std::string WM_project_splash_image_filepath(const Main *bmain)
@@ -276,6 +320,7 @@ static ImBuf *wm_block_splash_image(const Main *bmain, int width, int *r_height)
       IMB_scale(ibuf, width, height, IMBScaleFilter::Box, false);
     }
 
+    wm_toast_splash_badge_add(ibuf);
     wm_block_splash_image_roundcorners_add(ibuf);
     IMB_premultiply_alpha(ibuf);
   }

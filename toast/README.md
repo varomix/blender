@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/varomix/toast/main/images/toast_icon_256.png" alt="Toast" width="140">
+</p>
+
 # Blender with Toast
 
 This is a fork of [Blender](https://projects.blender.org/blender/blender) that adds

@@ -111,3 +111,5 @@
 *.rgb filter=lfs diff=lfs merge=lfs -text
 *.btx filter=lfs diff=lfs merge=lfs -text
 scripts/modules/_bpy_internal/assets/remote_library/*_openapi.py linguist-generated=true
+# Toast fork: small images of the fork are stored in Git (GitHub keeps no LFS files for forks).
+release/datafiles/toast_*.png -filter -diff -merge binary
