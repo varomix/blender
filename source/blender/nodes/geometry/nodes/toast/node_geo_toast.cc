@@ -205,7 +205,15 @@ struct SigAttr {
   bool write = false;
   bool create = false;
   bool snapshot = false;
+  /** Values of an output() socket, stored as the socket's anonymous attribute. */
+  bool output = false;
   AttrDomain domain = AttrDomain::Point;
+};
+
+/** An output() socket: `socket` is the socket type (Float, Integer, Boolean, Vector...). */
+struct SigOutput {
+  std::string name;
+  std::string socket;
 };
 
 struct SigParam {
@@ -222,6 +230,7 @@ struct Signature {
   std::string run_over;
   Vector<SigAttr> attrs;
   Vector<SigParam> params;
+  Vector<SigOutput> outputs;
   int params_size = 0;
   bool uses_cmd = false;
   bool uses_time = false;
@@ -293,6 +302,7 @@ static std::optional<Signature> parse_signature(const StringRefNull json_str)
       attr.write = access.find('w') != StringRef::not_found;
       attr.create = a->lookup_bool("create").value_or(false);
       attr.snapshot = a->lookup_bool("snapshot").value_or(false);
+      attr.output = a->lookup_bool("output").value_or(false);
       const std::optional<AttrDomain> domain = domain_from_string(
           a->lookup_str("domain").value_or("point"));
       if (!domain) {
@@ -328,6 +338,17 @@ static std::optional<Signature> parse_signature(const StringRefNull json_str)
     }
   }
 
+  if (const io::serialize::ArrayValue *outputs = dict->lookup_array("outputs")) {
+    for (const std::shared_ptr<io::serialize::Value> &item : outputs->elements()) {
+      const io::serialize::DictionaryValue *o = item->as_dictionary_value();
+      if (o == nullptr) {
+        return std::nullopt;
+      }
+      sig.outputs.append({std::string(o->lookup_str("name").value_or("")),
+                          std::string(o->lookup_str("socket").value_or(""))});
+    }
+  }
+
   if (const io::serialize::DictionaryValue *uses = dict->lookup_dict("uses")) {
     sig.uses_cmd = uses->lookup_bool("cmd").value_or(false);
     sig.uses_time = uses->lookup_bool("time").value_or(false);
@@ -355,6 +376,11 @@ static std::optional<Signature> parse_signature(const StringRefNull json_str)
 static std::string param_identifier(const StringRef name)
 {
   return "p_" + std::string(name);
+}
+
+static std::string output_identifier(const StringRef name)
+{
+  return "o_" + std::string(name);
 }
 
 /** \} */
@@ -1607,6 +1633,8 @@ struct RunContext {
   float frame = 0.0f;
   float time = 0.0f;
   bke::AttributeFilter attribute_filter;
+  /** Anonymous attribute names of the output() sockets that are used, by output name. */
+  Map<std::string, std::string> output_ids;
 };
 
 using ComponentType = bke::GeometryComponent::Type;
@@ -1771,6 +1799,8 @@ static bool run_on_component(GeometrySet &geometry,
     Array<float3, 0> rgb; /* No inline buffer: the kernel keeps a pointer across moves. */
   };
   Vector<ColorWriteBack> color_writebacks;
+  /* Outputs nothing reads still need memory for the kernel to write to. */
+  Vector<GArray<>> unused_outputs;
   auto finish_writers = [&]() {
     for (bke::GSpanAttributeWriter &w : writers) {
       w.finish();
@@ -1782,6 +1812,28 @@ static bool run_on_component(GeometrySet &geometry,
       continue;
     }
     const AttrType type = *attr_type_from_code(attr.type_code);
+    if (attr.output) {
+      const int64_t size = input0_before.size(attr.domain);
+      const std::string *id = run.output_ids.lookup_ptr(attr.name);
+      if (id == nullptr) {
+        const CPPType &cpp_type = bke::attribute_type_to_cpp_type(type);
+        unused_outputs.append_as(cpp_type, size);
+        GArray<> &scratch = unused_outputs.last();
+        cpp_type.value_initialize_n(scratch.data(), size);
+        bindings[i] = {scratch.data(), size, attr.type_code, abi_domain(attr.domain)};
+        continue;
+      }
+      bke::GSpanAttributeWriter writer = attributes.lookup_or_add_for_write_span(
+          *id, attr.domain, type);
+      if (!writer) {
+        r_error = "Can't store output \"" + attr.name + "\"";
+        finish_writers();
+        return false;
+      }
+      bindings[i] = {writer.span.data(), writer.span.size(), attr.type_code, abi_domain(attr.domain)};
+      writers.append(std::move(writer));
+      continue;
+    }
     const std::string name = blender_name(attr.name, write_mesh, attr.domain);
     const bool is_color = attr.name == "color" && type == AttrType::Float3;
     if (name == "position" && attr.domain == AttrDomain::Instance && write_instances &&
@@ -2048,6 +2100,16 @@ static const bNodeSocket *find_input(const bNode &node, const StringRef identifi
 }
 
 /** Fill the kernel's Params block from the param() sockets. */
+static const bNodeSocket *find_output(const bNode &node, const StringRef identifier)
+{
+  for (const bNodeSocket *socket : node.output_sockets()) {
+    if (socket->identifier == identifier) {
+      return socket;
+    }
+  }
+  return nullptr;
+}
+
 static bool gather_params(GeoNodeExecParams &params,
                           const Signature &sig,
                           Array<int32_t> &r_buffer,
@@ -2137,6 +2199,18 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   RunContext run;
+  for (const SigOutput &output : kernel->signature.outputs) {
+    const std::string identifier = output_identifier(output.name);
+    if (find_output(params.node(), identifier) == nullptr) {
+      finish(std::string("The node's sockets are out of date, the code is being recompiled"));
+      return;
+    }
+    if (std::optional<std::string> id = params.get_output_anonymous_attribute_id_if_needed(
+            UString(identifier)))
+    {
+      run.output_ids.add(output.name, std::move(*id));
+    }
+  }
   run.kernel = kernel;
   run.selection = params.extract_input<Field<bool>>("Selection"_ustr);
   run.params = param_buffer;
@@ -2239,6 +2313,31 @@ static void node_declare(NodeDeclarationBuilder &b)
                                          p.default_value[1],
                                          p.default_value[2],
                                          p.default_value[3]));
+    }
+  }
+  for (const SigOutput &o : sig->outputs) {
+    const UString name(o.name);
+    const UString identifier(output_identifier(o.name));
+    if (o.socket == "Float") {
+      b.add_output<decl::Float>(name, identifier).anonymous_attribute_output();
+    }
+    else if (o.socket == "Integer") {
+      b.add_output<decl::Int>(name, identifier).anonymous_attribute_output();
+    }
+    else if (o.socket == "Boolean") {
+      b.add_output<decl::Bool>(name, identifier).anonymous_attribute_output();
+    }
+    else if (o.socket == "Vector") {
+      b.add_output<decl::Vector>(name, identifier).anonymous_attribute_output();
+    }
+    else if (o.socket == "Color") {
+      b.add_output<decl::Color>(name, identifier).anonymous_attribute_output();
+    }
+    else if (o.socket == "Rotation") {
+      b.add_output<decl::Rotation>(name, identifier).anonymous_attribute_output();
+    }
+    else if (o.socket == "Matrix") {
+      b.add_output<decl::Matrix>(name, identifier).anonymous_attribute_output();
     }
   }
 }
