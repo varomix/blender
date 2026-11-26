@@ -34,6 +34,7 @@
 
 #include "BLI_array.hh"
 #include "BLI_array_utils.hh"
+#include "BLI_enumerable_thread_specific.hh"
 #include "BLI_generic_array.hh"
 #include "BLI_kdtree_new.hh"
 #include "BLI_map.hh"
@@ -70,6 +71,8 @@
 #  include "BKE_volume_openvdb.hh"
 #  include "BLI_math_matrix.hh"
 #  include <openvdb/openvdb.h>
+#  include <openvdb/tools/Morphology.h>
+#  include <openvdb/tools/Prune.h>
 #endif
 
 #include "BLO_read_write.hh"
@@ -692,6 +695,10 @@ struct GridSlot {
 #ifdef WITH_OPENVDB
   bke::VolumeTreeAccessToken token;
   const openvdb::GridBase *vdb = nullptr;
+  /* A value accessor per thread (type-erased `GridT::ConstUnsafeAccessor`): it caches the last
+   * leaf it visited, so reading neighbor voxels skips the walk down the tree. */
+  std::unique_ptr<threading::EnumerableThreadSpecific<std::shared_ptr<void>>> accessors =
+      std::make_unique<threading::EnumerableThreadSpecific<std::shared_ptr<void>>>();
 #endif
   VolumeGridType type = VOLUME_GRID_UNKNOWN;
   bool vector = false;
@@ -788,10 +795,21 @@ template<typename T> static float3 voxel_to_float3(const T &value)
   }
 }
 
+template<typename GridT>
+static typename GridT::ConstUnsafeAccessor &slot_accessor(const GridSlot &slot)
+{
+  using Accessor = typename GridT::ConstUnsafeAccessor;
+  std::shared_ptr<void> &local = slot.accessors->local();
+  if (!local) {
+    local = std::make_shared<Accessor>(
+        static_cast<const GridT &>(*slot.vdb).getConstUnsafeAccessor());
+  }
+  return *static_cast<Accessor *>(local.get());
+}
+
 template<typename GridT> static float3 sample_typed(const GridSlot &slot, const float3 &p)
 {
-  const GridT &grid = static_cast<const GridT &>(*slot.vdb);
-  auto accessor = grid.getConstUnsafeAccessor();
+  auto &accessor = slot_accessor<GridT>(slot);
   const float4x4 &m = slot.to_index;
   const float x = m[0][0] * p.x + m[1][0] * p.y + m[2][0] * p.z + m[3][0];
   const float y = m[0][1] * p.x + m[1][1] * p.y + m[2][1] * p.z + m[3][1];
@@ -831,6 +849,13 @@ static float3 sample_slot(const GridSlot &slot, const float3 &p)
 static int32_t host_grid_sample(
     void *self, const int32_t grid, const int32_t mode, const float *pos3, float *out);
 
+/** activate_voxel()/deactivate_voxel() calls of a Run Over Voxels run, per thread (sets: the
+ * order doesn't matter). Activations are (i, j, k, radius). */
+struct VoxelCommands {
+  threading::EnumerableThreadSpecific<Vector<int4>> activate;
+  threading::EnumerableThreadSpecific<Vector<int3>> deactivate;
+};
+
 /**
  * The grids of the signature, found in the volumes of the inputs (null for none). Missing grids
  * and grids of another type read as zero, with a warning.
@@ -869,7 +894,23 @@ struct HostData {
   std::array<const bke::CurvesGeometry *, MAX_INPUTS> curves = {};
   /* sample_grid() slots, by the signature's grids. */
   Span<GridSlot> grids;
+  /* Run Over Voxels: where activate_voxel()/deactivate_voxel() go (null in other modes). */
+  VoxelCommands *voxel_cmds = nullptr;
 };
+
+static void host_voxel_cmd(void *self, const int32_t op, const int32_t *ijk, const int32_t radius)
+{
+  const HostData &host = *static_cast<const HostData *>(self);
+  if (host.voxel_cmds == nullptr) {
+    return;
+  }
+  if (op == 1) {
+    host.voxel_cmds->activate.local().append(int4(ijk[0], ijk[1], ijk[2], radius));
+  }
+  else {
+    host.voxel_cmds->deactivate.local().append(int3(ijk[0], ijk[1], ijk[2]));
+  }
+}
 
 static int32_t host_grid_sample(
     void *self, const int32_t grid, const int32_t mode, const float *pos3, float *out)
@@ -882,6 +923,24 @@ static int32_t host_grid_sample(
   }
   const GridSlot &slot = host.grids[grid];
   const float3 p(pos3[0], pos3[1], pos3[2]);
+  if (mode == 2) {
+    /* The voxel at index p, rounded: the trilinear read at a whole index reads only it. */
+    float3 value = slot.background;
+    if (std::abs(p.x) < 1e9f && std::abs(p.y) < 1e9f && std::abs(p.z) < 1e9f) {
+      const int3 ijk(int(std::floor(p.x + 0.5f)), int(std::floor(p.y + 0.5f)),
+                     int(std::floor(p.z + 0.5f)));
+      with_toast_grid_type(slot.type, [&]<typename GridT>() {
+        value = voxel_to_float3(
+            slot_accessor<GridT>(slot).getValue(openvdb::Coord(ijk.x, ijk.y, ijk.z)));
+      });
+    }
+    out[0] = value.x;
+    if (slot.vector) {
+      out[1] = value.y;
+      out[2] = value.z;
+    }
+    return 1;
+  }
   if (mode == 1) {
     if (slot.vector) {
       return 0;
@@ -2428,6 +2487,8 @@ struct RunContext {
   RunWarnings *warnings = nullptr;
   /** Input 0's volume for sample_grid(), when it isn't the geometry's (Run Over Voxels). */
   const Volume *volume0 = nullptr;
+  /** Run Over Voxels: collects activate_voxel()/deactivate_voxel(). */
+  VoxelCommands *voxel_cmds = nullptr;
 };
 
 using ComponentType = bke::GeometryComponent::Type;
@@ -2749,6 +2810,7 @@ static bool run_on_component(GeometrySet &geometry,
   }
 
   host_data.bindings = bindings;
+  host_data.voxel_cmds = run.voxel_cmds;
   Array<GridSlot> grid_slots;
   if (!sig.grids.is_empty()) {
     find_grid_slots(sig,
@@ -2791,7 +2853,8 @@ static bool run_on_component(GeometrySet &geometry,
                     host_add_curve,
                     host_extend_curve,
                     host_surface_point,
-                    host_grid_sample};
+                    host_grid_sample,
+                    host_voxel_cmd};
 
   const int64_t chunks_num = (run_size + GRAIN_SIZE - 1) / GRAIN_SIZE;
   Array<CmdBuffer> buffers(chunks_num);
@@ -3020,6 +3083,70 @@ template<typename ValueT, typename AttrT> static ValueT attr_to_voxel(const Attr
 }
 
 /**
+ * activate_voxel()/deactivate_voxel() on every grid of the volume with the run's transform:
+ * deactivations first, of voxels nothing activates (set to the background, then inactive nodes
+ * pruned), then activations (cubes of `radius` by dilation), as the harness's _apply_voxel_cmds.
+ */
+static void apply_voxel_commands(Volume &volume, const float4x4 &matrix, VoxelCommands &cmds)
+{
+  constexpr int max_radius = 16;
+  Array<openvdb::MaskTree> by_radius(max_radius + 1);
+  bool any = false;
+  for (const Vector<int4> &list : cmds.activate) {
+    for (const int4 &c : list) {
+      const int r = std::clamp(c.w, 0, max_radius);
+      by_radius[r].setValueOn(openvdb::Coord(c.x, c.y, c.z));
+      any = true;
+    }
+  }
+  openvdb::MaskTree activate;
+  if (any) {
+    for (const int r : by_radius.index_range()) {
+      if (by_radius[r].empty()) {
+        continue;
+      }
+      if (r > 0) {
+        openvdb::tools::dilateActiveValues(by_radius[r], r, openvdb::tools::NN_FACE_EDGE_VERTEX);
+      }
+      activate.topologyUnion(by_radius[r]);
+    }
+  }
+  openvdb::MaskTree deactivate;
+  for (const Vector<int3> &list : cmds.deactivate) {
+    for (const int3 &c : list) {
+      deactivate.setValueOn(openvdb::Coord(c.x, c.y, c.z));
+    }
+  }
+  deactivate.topologyDifference(activate);
+  if (activate.empty() && deactivate.empty()) {
+    return;
+  }
+  for (const int i : IndexRange(BKE_volume_num_grids(&volume))) {
+    bke::VolumeGridData *grid = BKE_volume_grid_get_for_write(&volume, i);
+    if (!is_toast_grid_type(grid->grid_type()) ||
+        !same_matrix(grid_matrix(grid->transform()), matrix))
+    {
+      continue;
+    }
+    bke::VolumeTreeAccessToken token;
+    openvdb::GridBase &base = grid->grid_for_write(token);
+    with_toast_grid_type(grid->grid_type(), [&]<typename GridT>() {
+      auto &tree = static_cast<GridT &>(base).tree();
+      if (!deactivate.empty()) {
+        auto accessor = tree.getAccessor();
+        for (auto it = deactivate.cbeginValueOn(); it; ++it) {
+          accessor.setValueOff(it.getCoord(), tree.background());
+        }
+        openvdb::tools::pruneInactive(tree);
+      }
+      if (!activate.empty()) {
+        tree.topologyUnion(activate);
+      }
+    });
+  }
+}
+
+/**
  * Run Over Voxels: the voxels active in any grid the code uses as an @ attribute (in all the
  * volume's grids when none of those exists yet), with tiles split into voxels, become the points
  * of a point cloud at the voxels' centers, ordered by leaf (origin x, y, z) and then by offset in
@@ -3037,7 +3164,9 @@ static bool run_on_volume(GeometrySet &geometry, const RunContext &run, std::str
   const Signature &sig = run.kernel->signature;
   Vector<std::string> used;
   for (const SigAttr &attr : sig.attrs) {
-    if (attr.input == 0 && !attr.output && attr.name != "position" && !used.contains(attr.name)) {
+    if (attr.input == 0 && !attr.output && attr.name != "position" &&
+        !StringRef(attr.name).startswith("__") && !used.contains(attr.name))
+    {
       used.append(attr.name);
     }
   }
@@ -3122,6 +3251,34 @@ static bool run_on_volume(GeometrySet &geometry, const RunContext &run, std::str
   }
   /* The grids' values as attributes, converted to the type the code uses them as. */
   bke::MutableAttributeAccessor attributes = pointcloud->attributes_for_write();
+  /* @voxel and @voxel_size. */
+  for (const SigAttr &attr : sig.attrs) {
+    if (attr.input != 0 || attributes.contains(attr.name)) {
+      continue;
+    }
+    if (attr.name == "__voxel") {
+      bke::SpanAttributeWriter<float3> writer =
+          attributes.lookup_or_add_for_write_only_span<float3>(attr.name, AttrDomain::Point);
+      foreach_leaf([&](const MaskLeaf &leaf, int64_t k) {
+        for (auto it = leaf.cbeginValueOn(); it; ++it, ++k) {
+          const openvdb::Coord c = it.getCoord();
+          writer.span[k] = float3(float(c.x()), float(c.y()), float(c.z()));
+        }
+      });
+      writer.finish();
+    }
+    else if (attr.name == "__voxel_size") {
+      float3 size;
+      for (const int a : IndexRange(3)) {
+        size[a] = std::sqrt(matrix[a][0] * matrix[a][0] + matrix[a][1] * matrix[a][1] +
+                            matrix[a][2] * matrix[a][2]);
+      }
+      bke::SpanAttributeWriter<float3> writer =
+          attributes.lookup_or_add_for_write_only_span<float3>(attr.name, AttrDomain::Point);
+      writer.span.fill(size);
+      writer.finish();
+    }
+  }
   for (const SigAttr &attr : sig.attrs) {
     if (attr.input != 0 || attr.output || attr.name == "position" ||
         attributes.contains(attr.name))
@@ -3162,6 +3319,8 @@ static bool run_on_volume(GeometrySet &geometry, const RunContext &run, std::str
   GeometrySet voxels = GeometrySet::from_pointcloud(pointcloud);
   RunContext inner = run;
   inner.volume0 = volume;
+  VoxelCommands voxel_cmds;
+  inner.voxel_cmds = &voxel_cmds;
   if (!run_on_component(voxels, ComponentType::PointCloud, inner, r_error)) {
     return false;
   }
@@ -3172,7 +3331,7 @@ static bool run_on_volume(GeometrySet &geometry, const RunContext &run, std::str
   Vector<std::string> done;
   for (const SigAttr &attr : sig.attrs) {
     if (attr.input != 0 || !attr.write || attr.output || attr.name == "position" ||
-        done.contains(attr.name))
+        StringRef(attr.name).startswith("__") || done.contains(attr.name))
     {
       continue;
     }
@@ -3231,6 +3390,7 @@ static bool run_on_volume(GeometrySet &geometry, const RunContext &run, std::str
       BKE_volume_grid_add(volume_for_write, grid.get());
     }
   }
+  apply_voxel_commands(*volume_for_write, matrix, voxel_cmds);
   return true;
 }
 
