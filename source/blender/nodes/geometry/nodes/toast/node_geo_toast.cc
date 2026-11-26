@@ -1247,12 +1247,90 @@ struct ReadBinding {
  * copy; otherwise it is copied in parallel (snapshots must be copies, since the kernel writes the
  * same attribute in place). `N` on a mesh without an `N` attribute reads the vertex normals.
  */
+/** Messages that don't stop the node (shown as warnings), collected from every component. */
+struct RunWarnings {
+  std::mutex mutex;
+  VectorSet<std::string> messages;
+  void add(std::string message)
+  {
+    std::lock_guard lock{mutex};
+    messages.add(std::move(message));
+  }
+};
+
+/** A Blender attribute type in Toast's words, and how many numbers it holds. */
+static std::pair<StringRefNull, int> toast_type_info(const AttrType type)
+{
+  switch (type) {
+    case AttrType::Bool:
+      return {"bool", 1};
+    case AttrType::Int8:
+    case AttrType::Int32:
+      return {"int", 1};
+    case AttrType::Float:
+      return {"float", 1};
+    case AttrType::Int16_2D:
+    case AttrType::Int32_2D:
+      return {"2D integer vector", 2};
+    case AttrType::Float2:
+      return {"vec2", 2};
+    case AttrType::Float3:
+      return {"vec3", 3};
+    case AttrType::Float4:
+    case AttrType::ColorFloat:
+    case AttrType::ColorByte:
+      return {"vec4", 4};
+    case AttrType::Quaternion:
+      return {"quat", 4};
+    case AttrType::Float4x4:
+      return {"mat4", 16};
+    case AttrType::String:
+      return {"string", 0};
+  }
+  return {"?", 0};
+}
+
+/**
+ * Reading an attribute as another type converts it silently: a vec3 read as a float (the type of
+ * an attribute the code doesn't annotate) is wrong without any error. Warn when the conversion
+ * loses data: another number of components, or a float read as an int or bool.
+ */
+static std::optional<std::string> read_type_warning(const SigAttr &attr,
+                                                    const AttrType code_type,
+                                                    const AttrType geometry_type,
+                                                    const std::optional<AttrDomain> run_domain)
+{
+  if (attr.name == "color" || code_type == geometry_type) {
+    return std::nullopt; /* @color is the color attribute's RGB, by design. */
+  }
+  const auto [code_name, code_size] = toast_type_info(code_type);
+  const auto [geo_name, geo_size] = toast_type_info(geometry_type);
+  const bool truncates = geometry_type == AttrType::Float &&
+                         ELEM(code_type, AttrType::Int32, AttrType::Bool);
+  if (code_size == geo_size && !truncates) {
+    return std::nullopt;
+  }
+  std::string message = "\"" + attr.name + "\" is a " + std::string(geo_name) + " on " +
+                        (attr.input == 0 ? "the geometry" : "Input 1") +
+                        ", but the code reads it as a " + std::string(code_name) + ". ";
+  if (geo_size == 0 || geo_name == StringRef("2D integer vector")) {
+    return message + "Toast can't read this type";
+  }
+  if (attr.input == 0 && run_domain && attr.domain == *run_domain) {
+    return message + "Give it its type: @" + attr.name + ": " + std::string(geo_name);
+  }
+  return message + "Give it its type: x: " + std::string(geo_name) + " = ..._attr(" +
+         std::to_string(attr.input) + ", \"" + attr.name + "\", ...)";
+}
+
 static bool read_attribute(const PointsSource &source,
                            const SigAttr &attr,
                            const AttrType type,
                            const bool allow_view,
                            ReadBinding &r_binding,
-                           std::string &r_error)
+                           std::string &r_error,
+                           RunWarnings *warnings = nullptr,
+                           const std::optional<AttrDomain> run_domain = std::nullopt)
 {
   const CPPType &cpp_type = bke::attribute_type_to_cpp_type(type);
   const AttrDomain domain = attr.domain;
@@ -1269,6 +1347,15 @@ static bool read_attribute(const PointsSource &source,
     return true;
   }
   if (attributes && attributes->contains(name)) {
+    if (warnings) {
+      if (const std::optional<bke::AttributeMetaData> meta = attributes->lookup_meta_data(name)) {
+        if (std::optional<std::string> warning = read_type_warning(
+                attr, type, meta->data_type, run_domain))
+        {
+          warnings->add(std::move(*warning));
+        }
+      }
+    }
     bke::GAttributeReader reader = attributes->lookup(name, domain, type);
     if (!reader) {
       r_error = "Attribute \"" + std::string(attr.name) + "\" can't be read as " +
@@ -1732,6 +1819,7 @@ struct RunContext {
   bke::AttributeFilter attribute_filter;
   /** Anonymous attribute names of the output() sockets that are used, by output name. */
   Map<std::string, std::string> output_ids;
+  RunWarnings *warnings = nullptr;
 };
 
 using ComponentType = bke::GeometryComponent::Type;
@@ -1833,8 +1921,14 @@ static bool run_on_component(GeometrySet &geometry,
   for (const int64_t i : sig.attrs.index_range()) {
     const SigAttr &attr = sig.attrs[i];
     if (attr.input == 0 && attr.snapshot) {
-      if (!read_attribute(
-              input0_before, attr, *attr_type_from_code(attr.type_code), false, reads[i], r_error))
+      if (!read_attribute(input0_before,
+                          attr,
+                          *attr_type_from_code(attr.type_code),
+                          false,
+                          reads[i],
+                          r_error,
+                          run.warnings,
+                          domain))
       {
         return false;
       }
@@ -2016,8 +2110,14 @@ static bool run_on_component(GeometrySet &geometry,
     }
     if (!(attr.input == 0 && attr.snapshot)) {
       const PointsSource &source = attr.input == 0 ? input0 : input1_source;
-      if (!read_attribute(
-              source, attr, *attr_type_from_code(attr.type_code), true, reads[i], r_error))
+      if (!read_attribute(source,
+                          attr,
+                          *attr_type_from_code(attr.type_code),
+                          true,
+                          reads[i],
+                          r_error,
+                          run.warnings,
+                          domain))
       {
         finish_writers();
         return false;
@@ -2256,9 +2356,13 @@ static void node_geo_exec(GeoNodeExecParams params)
   const GeometrySet input1 = params.extract_input<GeometrySet>("Input 1"_ustr);
   const NodeGeometryToast &storage = node_storage(params.node());
 
+  RunWarnings warnings;
   auto finish = [&](const std::optional<std::string> &error, const bool is_info = false) {
     if (error) {
       params.error_message_add(is_info ? NodeWarningType::Info : NodeWarningType::Error, *error);
+    }
+    for (const std::string &warning : warnings.messages) {
+      params.error_message_add(NodeWarningType::Warning, warning);
     }
     params.set_output("Geometry"_ustr, std::move(geometry));
   };
@@ -2314,6 +2418,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   run.params = param_buffer;
   run.input1 = &input1;
   run.attribute_filter = params.get_attribute_filter("Geometry"_ustr);
+  run.warnings = &warnings;
   if (const Depsgraph *depsgraph = params.depsgraph()) {
     const Scene *scene = DEG_get_input_scene(depsgraph);
     run.frame = DEG_get_ctime(depsgraph);
