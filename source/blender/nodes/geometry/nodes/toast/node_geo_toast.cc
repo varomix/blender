@@ -237,6 +237,8 @@ struct Signature {
   int params_size = 0;
   bool uses_cmd = false;
   bool uses_time = false;
+  /* add_curve()/extend_curve(): Run Over Geometry runs on curves, made if there are none. */
+  bool builds_curves = false;
   bool uses_neighbors = false;
   Vector<int> nearpoints_inputs;
   Vector<int> surface_inputs;
@@ -355,6 +357,7 @@ static std::optional<Signature> parse_signature(const StringRefNull json_str)
   if (const io::serialize::DictionaryValue *uses = dict->lookup_dict("uses")) {
     sig.uses_cmd = uses->lookup_bool("cmd").value_or(false);
     sig.uses_time = uses->lookup_bool("time").value_or(false);
+    sig.builds_curves = uses->lookup_bool("curves").value_or(false);
     if (const io::serialize::ArrayValue *host = uses->lookup_array("host")) {
       for (const std::shared_ptr<io::serialize::Value> &c : host->elements()) {
         if (const io::serialize::StringValue *v = c->as_string_value()) {
@@ -608,15 +611,24 @@ class NearPointsQuery {
   }
 };
 
-enum class CmdKind : int8_t { AddPoint, AddPrim, RemovePoint, RemovePrim, SetAttr, RemoveCurve };
+enum class CmdKind : int8_t {
+  AddPoint,
+  AddPrim,
+  RemovePoint,
+  RemovePrim,
+  SetAttr,
+  RemoveCurve,
+  AddCurve,
+  ExtendCurve,
+};
 
 struct Cmd {
   CmdKind kind;
   int64_t src;
-  /* AddPoint: position. */
+  /* AddPoint, ExtendCurve: position. */
   float3 position;
-  /* RemovePoint: point. RemovePrim: face. SetAttr: element. AddPrim: range in
-   * #CmdBuffer::prim_points. */
+  /* RemovePoint: point. RemovePrim: face. SetAttr: element. RemoveCurve, ExtendCurve: curve.
+   * AddPrim, AddCurve: range in #CmdBuffer::prim_points. */
   int64_t point = 0;
   IndexRange prim_points;
   /* SetAttr: binding index and the value's bytes in #CmdBuffer::values. */
@@ -1102,6 +1114,33 @@ static void host_add_prim(
   buffer.cmds.append(c);
 }
 
+static void host_add_curve(
+    void * /*self*/, ToastCmdBuffer *cmd, const int64_t src, const int64_t *pts, const int32_t n)
+{
+  CmdBuffer &buffer = *reinterpret_cast<CmdBuffer *>(cmd);
+  const IndexRange range(buffer.prim_points.size(), std::max(n, 0));
+  buffer.prim_points.extend(Span<int64_t>(pts, range.size()));
+  Cmd c{CmdKind::AddCurve, src, float3(0.0f)};
+  c.prim_points = range;
+  buffer.cmds.append(c);
+}
+
+static int64_t host_extend_curve(void * /*self*/,
+                                 ToastCmdBuffer *cmd,
+                                 const int64_t src,
+                                 const int64_t curve,
+                                 const float *pos3)
+{
+  CmdBuffer &buffer = *reinterpret_cast<CmdBuffer *>(cmd);
+  /* A new point, numbered with add_point()'s. */
+  const int64_t handle = -((buffer.chunk_id << 32) | buffer.added) - 1;
+  buffer.added++;
+  Cmd c{CmdKind::ExtendCurve, src, float3(pos3[0], pos3[1], pos3[2])};
+  c.point = curve;
+  buffer.cmds.append(c);
+  return handle;
+}
+
 static void host_remove_point(void * /*self*/,
                               ToastCmdBuffer *cmd,
                               const int64_t src,
@@ -1493,7 +1532,10 @@ struct NewPointSet {
 
 struct MergedCommands {
   Vector<float3> new_positions;
+  /* For each new point: the curve extend_curve() put it at the tip of, or -1 (add_point). */
+  Vector<int> new_point_curves;
   Vector<Vector<int>> new_prims;
+  Vector<Vector<int>> new_curves;
   Vector<int> removed;
   Vector<int> removed_prims;
   Vector<int> removed_curves;
@@ -1502,7 +1544,7 @@ struct MergedCommands {
   bool has_changes() const
   {
     return !new_positions.is_empty() || !new_prims.is_empty() || !removed.is_empty() ||
-           !removed_prims.is_empty() || !removed_curves.is_empty();
+           !removed_prims.is_empty() || !removed_curves.is_empty() || !new_curves.is_empty();
   }
 };
 
@@ -1555,8 +1597,22 @@ static bool merge_commands(Span<CmdBuffer> buffers,
       switch (cmd.kind) {
         case CmdKind::AddPoint:
           r_merged.new_positions.append(cmd.position);
+          r_merged.new_point_curves.append(-1);
           break;
-        case CmdKind::AddPrim: {
+        case CmdKind::ExtendCurve:
+          if (curves_num == 0) {
+            r_error = "extend_curve() needs curves, the code ran on a mesh or point cloud";
+            return false;
+          }
+          if (cmd.point < 0 || cmd.point >= curves_num) {
+            r_error = "extend_curve(): curve " + std::to_string(cmd.point) + " does not exist";
+            return false;
+          }
+          r_merged.new_positions.append(cmd.position);
+          r_merged.new_point_curves.append(int(cmd.point));
+          break;
+        case CmdKind::AddPrim:
+        case CmdKind::AddCurve: {
           Vector<int> prim;
           for (const int64_t pt : buffer.prim_points.as_span().slice(cmd.prim_points)) {
             int index;
@@ -1565,7 +1621,12 @@ static bool merge_commands(Span<CmdBuffer> buffers,
             }
             prim.append(index);
           }
-          r_merged.new_prims.append(std::move(prim));
+          if (cmd.kind == CmdKind::AddPrim) {
+            r_merged.new_prims.append(std::move(prim));
+          }
+          else {
+            r_merged.new_curves.append(std::move(prim));
+          }
           break;
         }
         case CmdKind::SetAttr: {
@@ -1832,35 +1893,196 @@ static bool apply_to_pointcloud(GeometrySet &geometry,
   return true;
 }
 
+/**
+ * Curves, as the harness does it (see `_merge_curves`). Points are numbered in merged order:
+ * the input's, then add_point()/extend_curve() ones. extend_curve() points go at the tip of their
+ * curve and copy the tip point's other attributes; add_point() points get default values and must
+ * each be in exactly one add_curve() curve, which go after the input's curves. Then
+ * set_point_attr() on new points, then removals. Each curve's points are stored together.
+ */
 static bool apply_to_curves(GeometrySet &geometry,
                             const MergedCommands &merged,
+                            Span<SigAttr> sig_attrs,
                             const bke::AttributeFilter &attribute_filter,
                             std::string &r_error)
 {
-  if (!merged.new_positions.is_empty() || !merged.new_prims.is_empty() ||
-      !merged.removed_prims.is_empty())
-  {
-    r_error = "add_point(), add_edge(), add_face() and remove_face() need a mesh, the code ran on "
-              "curves";
+  if (!merged.new_prims.is_empty() || !merged.removed_prims.is_empty()) {
+    r_error = "add_edge(), add_face() and remove_face() need a mesh, the code ran on curves";
     return false;
   }
   const Curves &src_id = *geometry.get_curves();
   const bke::CurvesGeometry &src = src_id.geometry.wrap();
-  /* Removing a curve removes its points; curves left without points are removed. */
-  Array<bool> keep(src.points_num(), true);
+  const OffsetIndices<int> src_points_by_curve = src.points_by_curve();
+  const int old_points = src.points_num();
+  const int old_curves = src.curves_num();
+  const int new_num = merged.new_positions.size();
+  const int all_points = old_points + new_num;
+
+  /* Which points each new curve uses: add_point() ones exactly once, nothing else. */
+  Array<int> used(new_num, 0);
+  for (const Span<int> curve : merged.new_curves) {
+    for (const int pt : curve) {
+      if (pt < old_points || merged.new_point_curves[pt - old_points] != -1) {
+        r_error = "add_curve(): point " + std::to_string(pt) + " is already in a curve";
+        return false;
+      }
+      used[pt - old_points]++;
+    }
+  }
+  for (const int k : IndexRange(new_num)) {
+    if (merged.new_point_curves[k] == -1 && used[k] != 1) {
+      r_error = "Point " + std::to_string(old_points + k) + " from add_point() is in " +
+                std::to_string(used[k]) + " curves (add_curve), it must be in one";
+      return false;
+    }
+  }
+
+  /* Points in merged order, with their attributes, in a point cloud used as storage. */
+  PointCloud *merged_points = bke::pointcloud_new_no_attributes(PointCloudType::Points, all_points);
+  BLI_SCOPED_DEFER([&]() { BKE_id_free(nullptr, merged_points); });
+  {
+    Array<int> sources(all_points);
+    array_utils::fill_index_range<int>(sources.as_mutable_span().take_front(old_points));
+    Vector<int> defaults;
+    for (const int k : IndexRange(new_num)) {
+      const int curve = merged.new_point_curves[k];
+      if (curve == -1 || src_points_by_curve[curve].is_empty()) {
+        sources[old_points + k] = 0;
+        defaults.append(old_points + k);
+      }
+      else {
+        sources[old_points + k] = src_points_by_curve[curve].last();
+      }
+    }
+    bke::MutableAttributeAccessor dst = merged_points->attributes_for_write();
+    if (old_points > 0) {
+      bke::gather_attributes(
+          src.attributes(), AttrDomain::Point, AttrDomain::Point, attribute_filter, sources, dst);
+    }
+    else {
+      src.attributes().foreach_attribute([&](const bke::AttributeIter &iter) {
+        if (iter.domain != AttrDomain::Point || iter.data_type == bke::AttrType::String ||
+            attribute_filter.allow_skip(iter.name))
+        {
+          return;
+        }
+        dst.add(iter.name, AttrDomain::Point, iter.data_type, bke::AttributeInitDefaultValue());
+      });
+    }
+    if (!defaults.is_empty()) {
+      IndexMaskMemory memory;
+      const IndexMask mask = IndexMask::from_indices(defaults.as_span(), memory);
+      dst.foreach_attribute([&](const bke::AttributeIter &iter) {
+        if (iter.domain != AttrDomain::Point) {
+          return;
+        }
+        bke::GSpanAttributeWriter writer = dst.lookup_for_write_span(iter.name);
+        if (writer) {
+          writer.span.type().value_initialize_indices(writer.span.data(), mask);
+          writer.finish();
+        }
+      });
+    }
+    bke::SpanAttributeWriter<float3> positions = dst.lookup_or_add_for_write_span<float3>(
+        "position", AttrDomain::Point);
+    positions.span.drop_front(old_points).copy_from(merged.new_positions);
+    positions.finish();
+    if (!apply_new_point_sets(dst, merged, sig_attrs, r_error)) {
+      return false;
+    }
+  }
+
+  /* Curves: the input's with their new tip points, then the new ones; removals last. */
+  Array<bool> keep_point(all_points, true);
   for (const int i : merged.removed) {
-    keep[i] = false;
+    keep_point[i] = false;
   }
-  const OffsetIndices<int> points_by_curve = src.points_by_curve();
+  Array<bool> keep_curve(old_curves + merged.new_curves.size(), true);
   for (const int curve : merged.removed_curves) {
-    keep.as_mutable_span().slice(points_by_curve[curve]).fill(false);
+    keep_curve[curve] = false;
+    keep_point.as_mutable_span().slice(src_points_by_curve[curve]).fill(false);
   }
-  IndexMaskMemory memory;
-  const IndexMask kept = IndexMask::from_bools(keep, memory);
-  Curves *dst = bke::curves_new_nomain(
-      bke::curves_copy_point_selection(src, kept, attribute_filter));
-  bke::curves_copy_parameters(src_id, *dst);
-  geometry.replace_curves(dst);
+  Array<Vector<int>> tips(old_curves);
+  for (const int k : IndexRange(new_num)) {
+    if (merged.new_point_curves[k] != -1) {
+      tips[merged.new_point_curves[k]].append(old_points + k);
+    }
+  }
+  Vector<int> point_order;
+  Vector<int> curve_order; /* Kept curves: input curve, or old_curves + new curve. */
+  Vector<int> offsets = {0};
+  auto add_curve = [&](const int curve, auto &&points) {
+    const int64_t before = point_order.size();
+    for (const int pt : points) {
+      if (keep_point[pt]) {
+        point_order.append(pt);
+      }
+    }
+    if (keep_curve[curve] && point_order.size() > before) {
+      curve_order.append(curve);
+      offsets.append(point_order.size());
+    }
+    else {
+      point_order.resize(before);
+    }
+  };
+  for (const int curve : IndexRange(old_curves)) {
+    Vector<int> points;
+    for (const int pt : src_points_by_curve[curve]) {
+      points.append(pt);
+    }
+    points.extend(tips[curve]);
+    add_curve(curve, points);
+  }
+  for (const int k : merged.new_curves.index_range()) {
+    add_curve(old_curves + k, merged.new_curves[k].as_span());
+  }
+
+  bke::CurvesGeometry dst(point_order.size(), curve_order.size());
+  dst.offsets_for_write().copy_from(offsets);
+  bke::gather_attributes(merged_points->attributes(),
+                         AttrDomain::Point,
+                         AttrDomain::Point,
+                         attribute_filter,
+                         point_order.as_span(),
+                         dst.attributes_for_write());
+  /* Curve attributes: the input curves' values; defaults for new curves, which are poly. */
+  {
+    Vector<int> old_kept;
+    for (const int curve : curve_order) {
+      if (curve < old_curves) {
+        old_kept.append(curve);
+      }
+    }
+    const int added_kept = curve_order.size() - old_kept.size();
+    IndexMaskMemory memory;
+    const IndexMask old_mask = IndexMask::from_indices(old_kept.as_span(), memory);
+    src.attributes().foreach_attribute([&](const bke::AttributeIter &iter) {
+      if (iter.domain != AttrDomain::Curve || iter.data_type == bke::AttrType::String ||
+          attribute_filter.allow_skip(iter.name))
+      {
+        return;
+      }
+      const GVArray values = *iter.get();
+      bke::GSpanAttributeWriter writer = dst.attributes_for_write().lookup_or_add_for_write_span(
+          iter.name, AttrDomain::Curve, iter.data_type);
+      if (!writer) {
+        return;
+      }
+      array_utils::gather(values, old_mask, writer.span.take_front(old_kept.size()));
+      writer.span.type().value_initialize_n(writer.span.slice(old_kept.size(), added_kept).data(),
+                                            added_kept);
+      writer.finish();
+    });
+    if (added_kept > 0) {
+      dst.curve_types_for_write().drop_front(old_kept.size()).fill(CURVE_TYPE_POLY);
+      dst.update_curve_types();
+    }
+  }
+  dst.tag_topology_changed();
+  Curves *dst_id = bke::curves_new_nomain(std::move(dst));
+  bke::curves_copy_parameters(src_id, *dst_id);
+  geometry.replace_curves(dst_id);
   return true;
 }
 
@@ -2248,7 +2470,9 @@ static bool run_on_component(GeometrySet &geometry,
                     host_closest_point,
                     host_ncurves,
                     host_curve_points,
-                    host_remove_curve};
+                    host_remove_curve,
+                    host_add_curve,
+                    host_extend_curve};
 
   const int64_t chunks_num = (run_size + GRAIN_SIZE - 1) / GRAIN_SIZE;
   Array<CmdBuffer> buffers(chunks_num);
@@ -2315,7 +2539,7 @@ static bool run_on_component(GeometrySet &geometry,
   }
   switch (type) {
     case ComponentType::Curve:
-      return apply_to_curves(geometry, merged, run.attribute_filter, r_error);
+      return apply_to_curves(geometry, merged, sig.attrs, run.attribute_filter, r_error);
     case ComponentType::Instance:
       return apply_to_instances(geometry, merged, run.attribute_filter, r_error);
     default:
@@ -2325,6 +2549,10 @@ static bool run_on_component(GeometrySet &geometry,
     r_error = "remove_curve() needs curves, the code ran on a mesh or point cloud";
     return false;
   }
+  if (!merged.new_curves.is_empty()) {
+    r_error = "add_curve() needs curves, the code ran on a mesh or point cloud";
+    return false;
+  }
   if (is_mesh) {
     return apply_to_mesh(geometry, merged, sig.attrs, run.attribute_filter, r_error);
   }
@@ -2332,7 +2560,9 @@ static bool run_on_component(GeometrySet &geometry,
 }
 
 /** The components of one real geometry the kernel runs on, by Run Over. */
-static Vector<ComponentType> components_to_run(GeometrySet &geometry, const StringRef run_over)
+static Vector<ComponentType> components_to_run(GeometrySet &geometry,
+                                               const StringRef run_over,
+                                               const bool builds_curves)
 {
   Vector<ComponentType> types;
   const Mesh *mesh = geometry.get_mesh();
@@ -2355,7 +2585,15 @@ static Vector<ComponentType> components_to_run(GeometrySet &geometry, const Stri
     }
   }
   else if (run_over == "geometry") {
-    /* Runs once, also on empty geometry, which gets a mesh to build into. */
+    /* Runs once, also on empty geometry, which gets a mesh to build into (curves when the code
+     * makes curves). */
+    if (builds_curves || (!mesh && !pointcloud && curves)) {
+      if (!curves) {
+        geometry.replace_curves(bke::curves_new_nomain(0, 0));
+      }
+      types.append(ComponentType::Curve);
+      return types;
+    }
     if (!mesh && !pointcloud) {
       geometry.replace_mesh(BKE_mesh_new_nomain(0, 0, 0, 0));
     }
@@ -2517,7 +2755,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
   std::mutex error_mutex;
   geometry::foreach_real_geometry(geometry, [&](GeometrySet &real_geometry) {
-    for (const ComponentType type : components_to_run(real_geometry, run_over)) {
+    for (const ComponentType type :
+         components_to_run(real_geometry, run_over, kernel->signature.builds_curves))
+    {
       std::string local_error;
       if (!run_on_component(real_geometry, type, run, local_error)) {
         std::lock_guard lock{error_mutex};
