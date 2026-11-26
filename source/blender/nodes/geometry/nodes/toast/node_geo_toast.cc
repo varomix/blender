@@ -79,6 +79,8 @@
 #include "UI_interface_layout.hh"
 #include "UI_resources.hh"
 
+#include "WM_api.hh"
+
 #include "jit/toast_jit.h"
 #include "node_geometry_util.hh"
 #include "toast_abi.h"
@@ -2406,6 +2408,14 @@ static void node_layout(ui::Layout &layout, bContext * /*C*/, PointerRNA *ptr)
 {
   layout.prop(ptr, "text", ui::ITEM_R_SPLIT_EMPTY_NAME, "", ICON_NONE);
   layout.prop(ptr, "run_over", UI_ITEM_NONE, "", ICON_NONE);
+  /* The Toast add-on's compile operator (the add-on compiles; without it there is nothing to
+   * call). */
+  if (WM_operatortype_find("TOAST_OT_compile_node", true)) {
+    const bNode &node = *ptr->data_as<bNode>();
+    PointerRNA op_ptr = layout.op("TOAST_OT_compile_node", IFACE_("Compile"), ICON_FILE_REFRESH);
+    RNA_string_set(&op_ptr, "tree", ptr->owner_id->name + 2);
+    RNA_string_set(&op_ptr, "node", node.name);
+  }
 }
 
 /* RNA: the code text (bNode.id) and the strings the add-on writes. */
