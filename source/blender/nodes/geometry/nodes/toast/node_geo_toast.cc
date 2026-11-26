@@ -53,6 +53,7 @@
 #include "BKE_attribute.hh"
 #include "BKE_bvh.hh"
 #include "BKE_curves.hh"
+#include "BKE_grease_pencil.hh"
 #include "BKE_geometry_fields.hh"
 #include "BKE_global.hh"
 #include "BKE_instances.hh"
@@ -2141,6 +2142,7 @@ static bool run_on_component(GeometrySet &geometry,
   const std::optional<AttrDomain> domain = run_domain(sig.run_over);
   const bool is_once = sig.run_over == "geometry";
   const bool is_mesh = type == ComponentType::Mesh;
+  const bool type_is_curves = type == ComponentType::Curve;
 
   PointsSource input1_source;
   if (run.input1) {
@@ -2364,8 +2366,11 @@ static bool run_on_component(GeometrySet &geometry,
         return false;
       }
     }
+    /* Grease Pencil's colors (strokes run as curves) are float colors, as Blender makes them. */
+    const bool is_stroke_color = !meta && type == AttrType::Float4 &&
+                                 type_is_curves && ELEM(name, "vertex_color", "fill_color");
     bke::GSpanAttributeWriter writer = attributes.lookup_or_add_for_write_span(
-        name, attr.domain, is_color ? AttrType::ColorFloat : type);
+        name, attr.domain, (is_color || is_stroke_color) ? AttrType::ColorFloat : type);
     if (!writer) {
       r_error = "Can't write attribute \"" + attr.name + "\"";
       finish_writers();
@@ -2559,6 +2564,38 @@ static bool run_on_component(GeometrySet &geometry,
   return apply_to_pointcloud(geometry, merged, sig.attrs, run.attribute_filter, r_error);
 }
 
+/**
+ * Grease Pencil: each layer's strokes on the current frame are curves. They run like a Curves
+ * component (Run Over Points and Curves, and Geometry when the code makes curves), one layer
+ * after the other, and go back into the drawing.
+ */
+static bool run_on_grease_pencil(GeometrySet &geometry, const RunContext &run, std::string &r_error)
+{
+  GreasePencil *grease_pencil = geometry.get_grease_pencil_for_write();
+  if (grease_pencil == nullptr) {
+    return true;
+  }
+  for (const int layer_index : grease_pencil->layers().index_range()) {
+    bke::greasepencil::Drawing *drawing = grease_pencil->get_eval_drawing(
+        grease_pencil->layer(layer_index));
+    if (drawing == nullptr) {
+      continue;
+    }
+    GeometrySet strokes = GeometrySet::from_curves(
+        bke::curves_new_nomain(std::move(drawing->strokes_for_write())));
+    const bool ok = run_on_component(strokes, ComponentType::Curve, run, r_error);
+    /* The strokes go back even after an error (then unchanged). */
+    Curves *result = strokes.get_curves_for_write();
+    drawing->strokes_for_write() = result ? std::move(result->geometry.wrap()) :
+                                            bke::CurvesGeometry();
+    drawing->tag_topology_changed();
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** The components of one real geometry the kernel runs on, by Run Over. */
 static Vector<ComponentType> components_to_run(GeometrySet &geometry,
                                                const StringRef run_over,
@@ -2589,6 +2626,9 @@ static Vector<ComponentType> components_to_run(GeometrySet &geometry,
      * makes curves). */
     if (builds_curves || (!mesh && !pointcloud && curves)) {
       if (!curves) {
+        if (geometry.has_grease_pencil()) {
+          return types; /* The code draws into the layers instead, see run_on_grease_pencil. */
+        }
         geometry.replace_curves(bke::curves_new_nomain(0, 0));
       }
       types.append(ComponentType::Curve);
@@ -2765,6 +2805,18 @@ static void node_geo_exec(GeoNodeExecParams params)
           error = local_error;
         }
         return;
+      }
+    }
+    if (real_geometry.has_grease_pencil() &&
+        (run_over == "points" || run_over == "curves" ||
+         (run_over == "geometry" && kernel->signature.builds_curves)))
+    {
+      std::string local_error;
+      if (!run_on_grease_pencil(real_geometry, run, local_error)) {
+        std::lock_guard lock{error_mutex};
+        if (error.empty()) {
+          error = local_error;
+        }
       }
     }
   });
