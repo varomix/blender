@@ -41,6 +41,13 @@ function(toast_add_node_plugin name)
     PREFIX ""
     LIBRARY_OUTPUT_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/toast_plugins
   )
+  if(APPLE)
+    # Blender's symbols are resolved when the plugin is loaded into Blender (macOS exports them
+    # by default, see `symbols_apple.map`); Linux allows this without a flag.
+    target_link_options(${name} PRIVATE "LINKER:-undefined,dynamic_lookup")
+    # The loader looks next to the executable: `Blender.app/Contents/MacOS/toast_plugins`.
+    install(TARGETS ${name} LIBRARY DESTINATION "Blender.app/Contents/MacOS/toast_plugins")
+  endif()
 endfunction()
 
 function(toast_add_node_plugins)
