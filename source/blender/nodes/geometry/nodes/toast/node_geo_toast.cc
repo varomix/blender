@@ -372,7 +372,10 @@ struct LoadedKernel {
 static ToastJitCompileFn jit_compile = nullptr;
 static ToastJitSymbolFn jit_symbol = nullptr;
 
-/** The built-in compiler, `lib/libtoast_jit` next to the executable, loaded on first use. */
+/**
+ * The built-in compiler, loaded on first use: `lib/libtoast_jit.so` next to the executable, or on
+ * macOS `Blender.app/Contents/Resources/lib/libtoast_jit.dylib` (with Blender's other libraries).
+ */
 static void *load_jit(std::string &r_error)
 {
 #ifdef _WIN32
@@ -385,7 +388,12 @@ static void *load_jit(std::string &r_error)
   if (!tried) {
     tried = true;
     const char *program_dir = BKE_appdir_program_dir();
+#  ifdef __APPLE__
+    const std::string path = std::string(program_dir ? program_dir : ".") +
+                             "/../Resources/lib/libtoast_jit.dylib";
+#  else
     const std::string path = std::string(program_dir ? program_dir : ".") + "/lib/libtoast_jit.so";
+#  endif
     handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr) {
       const char *err = dlerror();

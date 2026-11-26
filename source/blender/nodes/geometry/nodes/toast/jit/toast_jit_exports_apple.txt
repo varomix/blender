@@ -1,0 +1,4 @@
+_toast_jit_api_version
+_toast_jit_llvm_version
+_toast_jit_compile
+_toast_jit_symbol

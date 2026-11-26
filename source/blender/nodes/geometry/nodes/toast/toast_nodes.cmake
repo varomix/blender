@@ -68,7 +68,7 @@ cmake_language(DEFER CALL toast_add_node_plugins)
 # functions are exported, so its LLVM can't clash with other copies in the process (OSL's).
 set(TOAST_JIT_LLVM_DIR "${LIBDIR}/llvm" CACHE PATH "LLVM with clang libraries for the Toast JIT")
 mark_as_advanced(TOAST_JIT_LLVM_DIR)
-if(UNIX AND NOT APPLE AND EXISTS "${TOAST_JIT_LLVM_DIR}/bin/llvm-config" AND
+if(UNIX AND EXISTS "${TOAST_JIT_LLVM_DIR}/bin/llvm-config" AND
    EXISTS "${TOAST_JIT_LLVM_DIR}/lib/libclangCodeGen.a")
   execute_process(
     COMMAND "${TOAST_JIT_LLVM_DIR}/bin/llvm-config" --libfiles all
@@ -81,10 +81,22 @@ if(UNIX AND NOT APPLE AND EXISTS "${TOAST_JIT_LLVM_DIR}/bin/llvm-config" AND
   file(GLOB _toast_clang_libs "${TOAST_JIT_LLVM_DIR}/lib/libclang*.a")
   add_library(toast_jit SHARED ${CMAKE_CURRENT_SOURCE_DIR}/nodes/toast/jit/toast_jit.cc)
   target_include_directories(toast_jit SYSTEM PRIVATE "${TOAST_JIT_LLVM_DIR}/include")
-  target_link_libraries(toast_jit PRIVATE
-    -Wl,--start-group ${_toast_clang_libs} ${_toast_llvm_libs} -Wl,--end-group
-    ${_toast_llvm_system_libs})
-  target_link_options(toast_jit PRIVATE -Wl,--exclude-libs,ALL -Wl,--gc-sections)
+  if(APPLE)
+    # Apple's linker searches static libraries in any order, and exports only what the list
+    # names, which keeps this LLVM's symbols out of the way of OSL's.
+    target_link_libraries(toast_jit PRIVATE
+      ${_toast_clang_libs} ${_toast_llvm_libs} ${_toast_llvm_system_libs})
+    target_link_options(toast_jit PRIVATE
+      "LINKER:-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/nodes/toast/jit/toast_jit_exports_apple.txt"
+      "LINKER:-dead_strip")
+    # Next to Blender's other libraries, where the Toast node looks for it.
+    install(TARGETS toast_jit LIBRARY DESTINATION "Blender.app/Contents/Resources/lib")
+  else()
+    target_link_libraries(toast_jit PRIVATE
+      -Wl,--start-group ${_toast_clang_libs} ${_toast_llvm_libs} -Wl,--end-group
+      ${_toast_llvm_system_libs})
+    target_link_options(toast_jit PRIVATE -Wl,--exclude-libs,ALL -Wl,--gc-sections)
+  endif()
   set_target_properties(toast_jit PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
