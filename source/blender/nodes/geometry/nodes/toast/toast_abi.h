@@ -15,7 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#define TOAST_ABI_VERSION 7
+#define TOAST_ABI_VERSION 8
 
 extern "C" {
 
@@ -99,6 +99,8 @@ typedef struct ToastHost {
   /* ABI 7. */
   int32_t (*surface_point)(
       void *self, int32_t input, float u, float v, float w, ToastHit *out);
+  /* ABI 8. */
+  int32_t (*grid_sample)(void *self, int32_t grid, int32_t mode, const float *pos3, float *out);
 } ToastHost;
 
 typedef struct ToastCtx {
@@ -122,7 +124,7 @@ typedef const char *(*ToastSignatureFn)();
 
 /* Layout checks; the same values are asserted by the harness through ctypes. */
 static_assert(sizeof(ToastAttr) == 24);
-static_assert(sizeof(ToastHost) == 176);
+static_assert(sizeof(ToastHost) == 184);
 static_assert(sizeof(ToastHit) == 60);
 static_assert(offsetof(ToastCtx, begin) == 8);
 static_assert(offsetof(ToastCtx, attrs) == 40);
