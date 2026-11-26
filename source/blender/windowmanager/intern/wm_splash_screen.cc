@@ -52,6 +52,10 @@
 
 #include "wm.hh"
 
+#ifdef WITH_PYTHON
+#  include "BPY_extern_run.hh"
+#endif
+
 namespace blender {
 
 /* -------------------------------------------------------------------- */
@@ -435,6 +439,28 @@ static int is_using_macos_rosetta()
 }
 #endif /* __APPLE__ */
 
+/* Toast fork: the version of the Toast add-on that is enabled now, read from the add-on when the
+ * splash opens (the add-on can be updated without rebuilding Blender). */
+static std::string wm_toast_splash_version(bContext *C)
+{
+#ifdef WITH_PYTHON
+  const char *imports[] = {"bpy", "sys", nullptr};
+  const char *expr =
+      "(lambda m: 'Toast ' + '.'.join(map(str, m.bl_info['version'])) "
+      "if m is not None and 'version' in getattr(m, 'bl_info', {}) else 'Toast add-on not enabled')"
+      "(sys.modules.get('toast') if 'toast' in bpy.context.preferences.addons else None)";
+  char *value = nullptr;
+  if (BPY_run_string_as_string(C, imports, expr, nullptr, &value) && value) {
+    std::string version = value;
+    MEM_delete(value);
+    return version;
+  }
+#else
+  UNUSED_VARS(C);
+#endif
+  return "";
+}
+
 static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*arg*/)
 {
   const uiStyle *style = ui::style_get_dpi();
@@ -465,6 +491,15 @@ static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*
                               BKE_blender_version_string(),
                               splash_width - 8.0 * UI_SCALE_FAC,
                               splash_height - 13.0 * UI_SCALE_FAC);
+
+    /* Toast fork: the Toast add-on's version, below the Toast badge (see
+     * #wm_toast_splash_badge_add: its bottom edge is 0.165 of the width from the top). */
+    const std::string toast_version = wm_toast_splash_version(C);
+    wm_block_splash_add_label(block,
+                              toast_version.c_str(),
+                              splash_width - 8.0 * UI_SCALE_FAC,
+                              splash_height - 13.0 * UI_SCALE_FAC - 0.165f * splash_width +
+                                  0.5f * U.widget_unit - 0.3f * UI_UNIT_Y);
   }
 
   /* Banner image passed through the environment, to overlay on the splash and
