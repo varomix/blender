@@ -1362,8 +1362,8 @@ struct SVMNodeToast {
   /* The function's address, `void (*)(const float *in, float *out)`: valid on the CPU only. */
   uint function_lo;
   uint function_hi;
-  /* On Metal: the function's number for `toast_dispatch`, in the Toast source placed before the
-   * kernel source (see ToastNode::metal_source). */
+  /* On Metal: the function's index in the kernels' Toast function table (see
+   * ToastNode::scene_source). */
   uint function_id;
   uint8_t num_inputs;
   uint8_t num_outputs;

@@ -4,9 +4,10 @@
 
 /* Toast fork: NODE_TOAST calls a function compiled from Toast code (the shader editor's Toast
  * node). On the CPU it is native code in the Blender process, called by its address. On Metal
- * the scene's Toast functions are compiled into the kernels: the source placed before the kernel
- * source defines `__TOAST_FUNCTIONS__` and `toast_dispatch()` (see ToastNode::metal_source).
- * Other devices write zero outputs. */
+ * the kernels of a scene with Toast nodes (`__TOAST_NODES__`) call it through a function table,
+ * the scene's Toast functions compiled on their own and linked in (see
+ * MetalDevice::set_toast_functions), so new Toast code doesn't build new kernels. Other devices
+ * write zero outputs. */
 
 #pragma once
 
@@ -15,7 +16,7 @@
 
 CCL_NAMESPACE_BEGIN
 
-#if !defined(__KERNEL_GPU__) || (defined(__KERNEL_METAL__) && defined(__TOAST_FUNCTIONS__))
+#if !defined(__KERNEL_GPU__) || (defined(__KERNEL_METAL__) && defined(__TOAST_NODES__))
 #  define SVM_TOAST_CALLS
 #endif
 
@@ -53,7 +54,7 @@ ccl_device_noinline void svm_node_toast(ccl_private float *ccl_restrict stack,
     }
   }
 #  ifdef __KERNEL_GPU__
-  toast_dispatch(int(node.function_id), in, out);
+  metal_ancillaries->ft_toast[node.function_id](in, out);
 #  else
   using ToastShaderFn = void (*)(const float *, float *);
   const uint64_t address = uint64_t(node.function_lo) | (uint64_t(node.function_hi) << 32);

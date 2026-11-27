@@ -394,6 +394,11 @@ struct MetalRTBlasWrapper {
 struct MetalAncillaries {
   device TextureParamsMetal *textures;
 
+#ifdef __TOAST_NODES__
+  /* Toast fork: the scene's Toast shader functions (NODE_TOAST), linked into the kernels. */
+  metal::visible_function_table<void(const thread float *, thread float *)> ft_toast;
+#endif
+
 #ifdef __KERNEL_METALRT__
   metalrt_as_type accel_struct;
   constant MetalRTBlasWrapper *blas_accel_structs;

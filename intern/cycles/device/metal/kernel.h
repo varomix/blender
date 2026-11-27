@@ -71,6 +71,8 @@ class MetalKernelPipeline {
   KernelData kernel_data_;
   bool use_metalrt;
   uint64_t kernel_features = 0;
+  /* Toast fork: built with `__TOAST_NODES__`, to link the Toast functions into. */
+  bool toast_nodes = false;
 
   int threads_per_threadgroup;
 
@@ -97,6 +99,7 @@ class MetalDispatchPipeline {
 
   bool update(MetalDevice *metal_device, DeviceKernel kernel);
   void free_intersection_function_tables();
+  void free_toast();
 
  private:
   friend class MetalDeviceQueue;
@@ -111,6 +114,14 @@ class MetalDispatchPipeline {
 
   API_AVAILABLE(macos(11.0))
   id<MTLIntersectionFunctionTable> intersection_func_table[METALRT_TABLE_NUM] = {nil};
+
+  /* Toast fork: whether the kernel calls Toast functions (MetalAncillaries::ft_toast), the
+   * pipeline with the device's Toast functions linked in (owned, the one used then), their table
+   * and generation (MetalDevice::toast_functions). */
+  bool toast_nodes = false;
+  id<MTLComputePipelineState> toast_pipeline = nil;
+  id<MTLVisibleFunctionTable> toast_table = nil;
+  int toast_generation = -1;
 };
 
 /* Cache of Metal kernels for each DeviceKernel. */

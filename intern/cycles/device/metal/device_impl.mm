@@ -244,6 +244,9 @@ MetalDevice::~MetalDevice()
   if (mtlCounterSampleBuffer) {
     [mtlCounterSampleBuffer release];
   }
+  if (toast_function_list) {
+    [toast_function_list release];
+  }
   [mtlDevice release];
 }
 
@@ -418,10 +421,10 @@ string MetalDevice::preprocess_source(MetalPipelineType pso_type,
     global_defines += "#define __KERNEL_USE_DATA_CONSTANTS__\n";
   }
 
-  /* Toast fork: the scene's Toast shader functions (and a define enabling NODE_TOAST), before
-   * the kernel source so Cycles' macros don't apply to them. In the hash: new functions make new
-   * kernels. */
-  global_defines += toast_source;
+  /* Toast fork: kernels calling Toast functions through a function table (NODE_TOAST). */
+  if (toast_nodes) {
+    global_defines += "#define __TOAST_NODES__\n";
+  }
 
   if (source) {
     *source = global_defines + *source;
@@ -430,6 +433,83 @@ string MetalDevice::preprocess_source(MetalPipelineType pso_type,
   MD5Hash md5;
   md5.append(global_defines);
   return md5.get_hex();
+}
+
+/* Toast fork: compile the Toast functions on their own, to link into the loaded kernels
+ * (MetalDispatchPipeline::update). Small, so quick: no kernel is built. */
+void MetalDevice::set_toast_functions(const string &source, const vector<string> &names)
+{
+  thread_scoped_lock lock(toast_mutex);
+  toast_nodes = !names.empty();
+  if (source == toast_source && names == toast_names) {
+    return;
+  }
+  toast_source = source;
+  toast_names = names;
+  toast_generation++;
+  if (toast_function_list) {
+    [toast_function_list release];
+    toast_function_list = nil;
+  }
+  if (names.empty()) {
+    return;
+  }
+
+  @autoreleasepool {
+    const double starttime = time_dt();
+    MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+    options.fastMathEnabled = YES;
+    options.languageVersion = MTLLanguageVersion3_0;
+    /* Compile the library and take its functions, compiled to binaries for linking. */
+    auto make_functions = [&](NSString *library_source, const vector<string> &function_names) {
+      NSError *error = nil;
+      id<MTLLibrary> library = [mtlDevice newLibraryWithSource:library_source
+                                                       options:options
+                                                         error:&error];
+      if (library == nil) {
+        LOG_ERROR << "Toast: Metal library failed to compile: "
+                  << (error ? [[error localizedDescription] UTF8String] : "");
+        return (NSMutableArray *)nil;
+      }
+      NSMutableArray *functions = [[NSMutableArray alloc] init];
+      for (const string &name : function_names) {
+        MTLFunctionDescriptor *desc = [MTLFunctionDescriptor functionDescriptor];
+        desc.name = @(name.c_str());
+        desc.options = MTLFunctionOptionCompileToBinary;
+        id<MTLFunction> function = [library newFunctionWithDescriptor:desc error:&error];
+        if (function == nil) {
+          LOG_ERROR << "Toast: Metal function " << name << " failed: "
+                    << (error ? [[error localizedDescription] UTF8String] : "");
+          [functions release];
+          functions = nil;
+          break;
+        }
+        [functions addObject:function];
+        [function release];
+      }
+      [library release];
+      return functions;
+    };
+
+    NSMutableArray *functions = make_functions(@(source.c_str()), names);
+    if (functions == nil) {
+      /* Not expected (the add-on checked the code), but the kernels need a function for every
+       * node: all of them output zero then. */
+      functions = make_functions(
+          @"[[visible]] void toast_zero(const thread float *in, thread float *out) {}",
+          vector<string>(names.size(), "toast_zero"));
+    }
+    [options release];
+    toast_function_list = functions;
+    metal_printf("Toast functions compiled in %.1f ms", (time_dt() - starttime) * 1000.0);
+  }
+}
+
+NSArray *MetalDevice::toast_functions(int &r_generation)
+{
+  thread_scoped_lock lock(toast_mutex);
+  r_generation = toast_generation;
+  return [toast_function_list retain];
 }
 
 void MetalDevice::make_source(MetalPipelineType pso_type, const uint64_t kernel_features)

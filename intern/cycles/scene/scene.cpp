@@ -236,13 +236,17 @@ void Scene::device_update(Device *device_, Progress &progress)
      * we have to redo the first part of the scene update. */
     const uint64_t kernel_features = dscene.data.kernel_features;
     scene_updated_while_loading_kernels = false;
-    /* Toast fork: devices that compile kernels from source (Metal) get the Toast functions. */
-    const string toast_source = ToastNode::scene_source(this);
-    device->set_toast_source(toast_source);
+    /* Toast fork: GPU devices (Metal) get the scene's Toast functions. The kernels only change
+     * when a scene gets its first Toast node or loses its last; new Toast code is linked into
+     * the loaded kernels. */
+    vector<string> toast_functions;
+    const string toast_source = ToastNode::scene_source(this, toast_functions);
+    device->set_toast_functions(toast_source, toast_functions);
+    const bool toast_nodes = !toast_functions.empty();
     if (!kernels_loaded || loaded_kernel_features != kernel_features ||
-        loaded_toast_source != toast_source)
+        loaded_toast_nodes != toast_nodes)
     {
-      loaded_toast_source = toast_source;
+      loaded_toast_nodes = toast_nodes;
       mutex.unlock();
       kernels_reloaded |= load_kernels(progress);
       mutex.lock();

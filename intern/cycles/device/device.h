@@ -196,10 +196,13 @@ class Device {
   /* constant memory */
   virtual void const_copy_to(const char *name, void *host, const size_t size) = 0;
 
-  /* Toast fork: source of the scene's Toast shader functions for devices that compile kernels
-   * from source (Metal), placed before the kernel source. Set before load_kernels(); a change
-   * makes the next load_kernels() build new kernels. */
-  virtual void set_toast_source(const string & /*source*/) {}
+  /* Toast fork: the scene's Toast shader functions for GPU devices (Metal): a library `source`
+   * of `[[visible]]` functions `void name(const float *in, float *out)`, in the order NODE_TOAST
+   * numbers them. Set before load_kernels(), which builds kernels calling them when there are
+   * any; changed functions are linked into the loaded kernels without building new ones. */
+  virtual void set_toast_functions(const string & /*source*/, const vector<string> & /*names*/)
+  {
+  }
 
   /* load/compile kernels, must be called before adding tasks */
   virtual bool load_kernels(const uint64_t /*kernel_features*/)

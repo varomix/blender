@@ -205,10 +205,10 @@ class MultiDevice : public Device {
     return bvh_layout_mask;
   }
 
-  void set_toast_source(const string &source) override
+  void set_toast_functions(const string &source, const vector<string> &names) override
   {
     for (SubDevice &sub : devices) {
-      sub.device->set_toast_source(source);
+      sub.device->set_toast_functions(source, names);
     }
   }
 

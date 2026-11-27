@@ -16,7 +16,8 @@
 #  define MAX_SAMPLE_BUFFER_LENGTH 4096
 
 /* The number of resources to be contiguously encoded into the MetalAncillaries struct. */
-#  define ANCILLARY_SLOT_COUNT 11
+/* Toast fork: one more for the Toast function table (MetalAncillaries::ft_toast). */
+#  define ANCILLARY_SLOT_COUNT 12
 
 CCL_NAMESPACE_BEGIN
 

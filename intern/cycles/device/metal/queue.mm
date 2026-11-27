@@ -469,6 +469,11 @@ bool MetalDeviceQueue::enqueue(DeviceKernel kernel,
     /* Encode ancillaries */
     int ancillary_index = 0;
     write_resource(ancillary_args, metal_device_->image_bindings, ancillary_index++);
+    /* Toast fork: in the struct with `__TOAST_NODES__` only. */
+    const bool toast_nodes = active_pipeline.toast_nodes;
+    if (toast_nodes) {
+      write_resource(ancillary_args, active_pipeline.toast_table, ancillary_index++);
+    }
 
     if (metal_device_->use_metalrt) {
       write_resource(ancillary_args, metal_device_->accel_struct, ancillary_index++);
@@ -479,7 +484,7 @@ bool MetalDeviceQueue::enqueue(DeviceKernel kernel,
         write_resource(
             ancillary_args, active_pipeline.intersection_func_table[table_idx], ancillary_index++);
       }
-      assert(ancillary_index == ANCILLARY_SLOT_COUNT);
+      assert(ancillary_index == ANCILLARY_SLOT_COUNT - (toast_nodes ? 0 : 1));
     }
 
     [mtlComputeCommandEncoder setBytes:dynamic_args length:dynamic_bytes_written atIndex:0];
@@ -509,6 +514,12 @@ bool MetalDeviceQueue::enqueue(DeviceKernel kernel,
                                           usage:MTLResourceUsageRead];
         }
       }
+    }
+
+    /* Toast fork: same fallback for the Toast function table. */
+    if (!metal_device_->mtlResidencySet_enabled && active_pipeline.toast_table) {
+      [mtlComputeCommandEncoder useResource:active_pipeline.toast_table
+                                      usage:MTLResourceUsageRead];
     }
 
     [mtlComputeCommandEncoder setComputePipelineState:active_pipeline.pipeline];

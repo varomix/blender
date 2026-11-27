@@ -356,6 +356,7 @@ void ShaderCache::load_kernel(DeviceKernel device_kernel,
   /* metalrt options */
   pipeline->use_metalrt = device->use_metalrt;
   pipeline->kernel_features = device->kernel_features;
+  pipeline->toast_nodes = device->toast_nodes;
 
   {
     thread_scoped_lock lock(cache_mutex);
@@ -480,9 +481,24 @@ void MetalDispatchPipeline::free_intersection_function_tables()
   }
 }
 
+void MetalDispatchPipeline::free_toast()
+{
+  if (toast_table) {
+    metal_device->metal_mem_free(toast_table);
+    toast_table = nil;
+  }
+  if (toast_pipeline) {
+    /* Command buffers using it keep their own reference. */
+    [toast_pipeline release];
+    toast_pipeline = nil;
+  }
+  toast_generation = -1;
+}
+
 MetalDispatchPipeline::~MetalDispatchPipeline()
 {
   free_intersection_function_tables();
+  free_toast();
 }
 
 bool MetalDispatchPipeline::update(MetalDevice *metal_device, DeviceKernel kernel)
@@ -494,14 +510,60 @@ bool MetalDispatchPipeline::update(MetalDevice *metal_device, DeviceKernel kerne
     return false;
   }
 
-  if (pipeline_id == best_pipeline->pipeline_id) {
+  /* Toast fork: the device's current Toast functions, when the kernel calls them. */
+  NSArray *toast_functions = nil;
+  int generation = -1;
+  if (best_pipeline->toast_nodes) {
+    toast_functions = metal_device->toast_functions(generation);
+  }
+
+  if (pipeline_id == best_pipeline->pipeline_id && generation == toast_generation) {
     /* The best pipeline is already active - nothing to do. */
+    [toast_functions release];
     return true;
   }
   pipeline_id = best_pipeline->pipeline_id;
   pipeline = best_pipeline->pipeline;
   pso_type = best_pipeline->pso_type;
   num_threads_per_block = best_pipeline->num_threads_per_block;
+  toast_nodes = best_pipeline->toast_nodes;
+
+  /* Toast fork: link the Toast functions into the kernel (quick, nothing is built again) and
+   * make their table. */
+  free_toast();
+  if (toast_functions) {
+    @autoreleasepool {
+      const double starttime = time_dt();
+      NSError *error = nil;
+      toast_pipeline = [best_pipeline->pipeline
+          newComputePipelineStateWithAdditionalBinaryFunctions:toast_functions
+                                                          error:&error];
+      if (toast_pipeline == nil) {
+        metal_device->set_error(string_printf(
+            "Toast: linking functions into %s failed: %s",
+            device_kernel_as_string(kernel),
+            error ? [[error localizedDescription] UTF8String] : ""));
+        [toast_functions release];
+        pipeline_id = -1;
+        return false;
+      }
+      MTLVisibleFunctionTableDescriptor *desc = [[MTLVisibleFunctionTableDescriptor alloc] init];
+      desc.functionCount = toast_functions.count;
+      toast_table = [toast_pipeline newVisibleFunctionTableWithDescriptor:desc];
+      [desc release];
+      for (NSUInteger i = 0; i < toast_functions.count; i++) {
+        [toast_table setFunction:[toast_pipeline functionHandleWithFunction:toast_functions[i]]
+                         atIndex:i];
+      }
+      metal_device->metal_mem_alloc(toast_table);
+      pipeline = toast_pipeline;
+      metal_printf("Toast functions linked into %s in %.1f ms",
+                   device_kernel_as_string(kernel),
+                   (time_dt() - starttime) * 1000.0);
+    }
+    [toast_functions release];
+  }
+  toast_generation = generation;
 
   /* Create the MTLIntersectionFunctionTables if needed. */
   if (best_pipeline->use_metalrt && device_kernel_has_intersection(best_pipeline->device_kernel)) {
@@ -661,6 +723,10 @@ void MetalKernelPipeline::compile()
   computePipelineStateDescriptor.maxCallStackDepth = 1;
   if (use_metalrt && device_kernel_has_intersection(device_kernel)) {
     computePipelineStateDescriptor.maxCallStackDepth = 2;
+  }
+  /* Toast fork: the Toast functions are linked in later (MetalDispatchPipeline::update). */
+  if (toast_nodes) {
+    computePipelineStateDescriptor.supportAddingBinaryFunctions = YES;
   }
 
   MTLPipelineOption pipelineOptions = MTLPipelineOptionNone;

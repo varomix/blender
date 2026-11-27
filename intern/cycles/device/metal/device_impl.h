@@ -30,8 +30,18 @@ class MetalDevice : public Device {
   string source[PSO_NUM];
   string kernels_md5[PSO_NUM];
   string global_defines_md5[PSO_NUM];
-  /* Toast fork: see Device::set_toast_source. */
+  /* Toast fork: see Device::set_toast_functions. `toast_nodes` adds `__TOAST_NODES__` to the
+   * kernels; `toast_function_list` are the compiled functions (MTLFunction, in table order),
+   * `toast_generation` counts changes to them. Guarded by `toast_mutex`. */
+  thread_mutex toast_mutex;
+  bool toast_nodes = false;
   string toast_source;
+  vector<string> toast_names;
+  NSArray *toast_function_list = nil;
+  int toast_generation = 0;
+
+  /* The current Toast functions (retained, release after use) and their generation. */
+  NSArray *toast_functions(int &r_generation);
 
   bool capture_enabled = false;
 
@@ -142,10 +152,7 @@ class MetalDevice : public Device {
 
   void make_source(MetalPipelineType pso_type, uint64_t kernel_features);
 
-  void set_toast_source(const string &source) override
-  {
-    toast_source = source;
-  }
+  void set_toast_functions(const string &source, const vector<string> &names) override;
 
   bool load_kernels(uint64_t kernel_features) override;
 
