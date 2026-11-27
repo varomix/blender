@@ -1391,6 +1391,10 @@ void ShaderModule::material_create_info_amend(GPUMaterial *gpumat, GPUCodegenOut
 
     vert_gen << "#line 1 \"" __FILE__ "\"\n";
     vert_gen << "#line " STRINGIFY(__LINE__) "\n";
+    if (use_vertex_displacement) {
+      /* Toast fork: runtime generated node functions. */
+      vert_gen << codegen.displacement.functions;
+    }
     vert_gen << "float3 nodetree_displacement(KernelGlobals kg, _ref(ShadingData, sd))\n";
     vert_gen << "{\n";
     vert_gen << ((use_vertex_displacement) ? codegen.displacement.serialized :
@@ -1423,12 +1427,17 @@ void ShaderModule::material_create_info_amend(GPUMaterial *gpumat, GPUCodegenOut
 
       frag_gen << "#line 1 \"" __FILE__ "\"\n";
       frag_gen << "#line " STRINGIFY(__LINE__) "\n";
+      frag_gen << codegen.displacement.functions;
       frag_gen << "float3 nodetree_displacement(KernelGlobals kg, _ref(ShadingData, sd))\n";
       frag_gen << "{\n";
       frag_gen << codegen.displacement.serialized;
       dependencies.extend(codegen.displacement.dependencies);
       frag_gen << "}\n\n";
     }
+
+    /* Toast fork: runtime generated node functions (each one guarded). */
+    frag_gen << codegen.surface.functions << codegen.thickness.functions
+             << codegen.volume.functions;
 
     /* Improve error logging. */
     frag_gen << "#line 1 \"" __FILE__ "\"\n";

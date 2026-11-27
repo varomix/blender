@@ -338,9 +338,22 @@ void GPUCodegen::generate_resources()
 
 void GPUCodegen::node_serialize(Set<StringRefNull> &used_libraries,
                                 std::stringstream &eval_ss,
+                                std::string &functions,
                                 const GPUNode *node)
 {
-  gpu_material_library_use_function(used_libraries, node->name);
+  if (node->source) {
+    /* Toast fork: a function generated at runtime, defined once per shader (the guard also
+     * covers the same function in other graphs of the material). */
+    const std::string guard = std::string("GPU_NODE_FN_") + node->name;
+    if (functions.find("#ifndef " + guard + "\n") == std::string::npos) {
+      functions += "#ifndef " + guard + "\n#define " + guard + "\n";
+      functions += node->source;
+      functions += "\n#endif\n";
+    }
+  }
+  else {
+    gpu_material_library_use_function(used_libraries, node->name);
+  }
 
   auto source_reference = [&](GPUInput *input) {
     BLI_assert(ELEM(input->source, GPU_SOURCE_OUTPUT, GPU_SOURCE_ATTR));
@@ -498,6 +511,7 @@ GPUGraphOutput GPUCodegen::graph_serialize(GPUNodeTag tree_tag,
 
   Set<StringRefNull> used_libraries;
   std::stringstream eval_ss;
+  std::string functions;
   bool has_nodes = false;
   /* NOTE: The node order is already top to bottom (or left to right in node editor)
    * because of the evaluation order inside ntreeExecGPUNodes(). */
@@ -505,7 +519,7 @@ GPUGraphOutput GPUCodegen::graph_serialize(GPUNodeTag tree_tag,
     if ((node.tag & tree_tag) == 0) {
       continue;
     }
-    node_serialize(used_libraries, eval_ss, &node);
+    node_serialize(used_libraries, eval_ss, functions, &node);
     has_nodes = true;
   }
 
@@ -523,21 +537,24 @@ GPUGraphOutput GPUCodegen::graph_serialize(GPUNodeTag tree_tag,
 
   std::string str = eval_ss.str();
   BLI_hash_mm2a_add(&hm2a_, reinterpret_cast<const uchar *>(str.c_str()), str.size());
-  return {str, set_to_vector_stable(used_libraries)};
+  BLI_hash_mm2a_add(&hm2a_, reinterpret_cast<const uchar *>(functions.c_str()), functions.size());
+  return {str, set_to_vector_stable(used_libraries), functions};
 }
 
 GPUGraphOutput GPUCodegen::graph_serialize(GPUNodeTag tree_tag)
 {
   std::stringstream eval_ss;
+  std::string functions;
   Set<StringRefNull> used_libraries;
   for (GPUNode &node : graph.nodes) {
     if (node.tag & tree_tag) {
-      node_serialize(used_libraries, eval_ss, &node);
+      node_serialize(used_libraries, eval_ss, functions, &node);
     }
   }
   std::string str = eval_ss.str();
   BLI_hash_mm2a_add(&hm2a_, reinterpret_cast<const uchar *>(str.c_str()), str.size());
-  return {str, set_to_vector_stable(used_libraries)};
+  BLI_hash_mm2a_add(&hm2a_, reinterpret_cast<const uchar *>(functions.c_str()), functions.size());
+  return {str, set_to_vector_stable(used_libraries), functions};
 }
 
 void GPUCodegen::generate_material_props()
@@ -678,6 +695,8 @@ void GPUCodegen::generate_graphs()
       /* Tag only the nodes needed for the current function */
       gpu_nodes_tag(&graph, func_link.outlink, GPU_NODE_TAG_FUNCTION);
       GPUGraphOutput graph = graph_serialize(GPU_NODE_TAG_FUNCTION, func_link.outlink);
+      /* Toast fork: runtime generated functions first (file scope, guarded). */
+      eval_ss << graph.functions;
       eval_ss << "float " << func_link.name << "(KernelGlobals kg, ShadingData sd) {\n"
               << graph.serialized << "}\n\n";
       output.material_functions.append({eval_ss.str(), graph.dependencies});

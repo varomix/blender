@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-"""Add/Swap menu entries for the Toast fork geometry nodes."""
+"""Add/Swap menu entries for the Toast fork nodes."""
 
 import bpy
 from bl_ui import node_add_menu
@@ -29,3 +29,11 @@ class NODE_MT_gn_toast_base(node_add_menu.NodeMenu):
         layout.operator("node.toast_reload_plugins", icon="FILE_REFRESH")
 
         self.draw_assets_for_catalog(layout, self.bl_label)
+
+
+class NODE_MT_shader_toast_base(node_add_menu.NodeMenu):
+    bl_label = "Toast"
+
+    def draw(self, _context):
+        self.node_operator(self.layout, "ShaderNodeToast")
+        self.draw_assets_for_catalog(self.layout, self.bl_label)

@@ -3785,6 +3785,24 @@ struct NodeGeometryToast {
   char _pad[6] = {};
 };
 
+/**
+ * Toast fork: storage of `ShaderNodeToast`, a per-shading-point procedural. The code is the Text
+ * data-block in `bNode.id`. The strings are written by the Toast add-on after it compiles the
+ * code.
+ */
+struct NodeShaderToast {
+  DNA_DEFINE_CXX_METHODS(NodeShaderToast)
+
+  /** Signature JSON (parameters, shading inputs, outputs, function name). */
+  char *signature = nullptr;
+  /** Generated GPU shader function (EEVEE and the viewport). */
+  char *gpu_source = nullptr;
+  /** Compile error from the add-on, shown on the node. Empty when the code compiled. */
+  char *error = nullptr;
+  /** Hash of the source the function was built from, so the add-on can tell when it is stale. */
+  char *source_hash = nullptr;
+};
+
 struct NodeIndexSwitch {
   DNA_DEFINE_CXX_METHODS(NodeIndexSwitch)
 

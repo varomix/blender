@@ -1077,6 +1077,44 @@ bool GPU_stack_link(GPUMaterial *material,
   return valid;
 }
 
+bool GPU_stack_link_source(GPUMaterial *material,
+                           const bNode *bnode,
+                           const char *name,
+                           const char *source,
+                           GPUNodeStack *in,
+                           GPUNodeStack *out,
+                           Span<GPUNodeLink *> extra_inputs,
+                           Span<GPUType> extra_types)
+{
+  BLI_assert(extra_inputs.size() == extra_types.size());
+  GPUNodeGraph *graph = gpu_material_node_graph(material);
+  GPUNode *node = gpu_node_create(nullptr);
+  node->owned_name = BLI_strdup(name);
+  node->name = node->owned_name;
+  node->source = BLI_strdup(source);
+
+  if (in) {
+    for (int i = 0; !in[i].end; i++) {
+      if (in[i].type != GPU_NONE) {
+        gpu_node_input_socket(material, bnode, node, &in[i], i);
+      }
+    }
+  }
+  for (const int i : extra_inputs.index_range()) {
+    gpu_node_input_link(node, extra_inputs[i], extra_types[i]);
+  }
+  if (out) {
+    for (int i = 0; !out[i].end; i++) {
+      if (out[i].type != GPU_NONE) {
+        gpu_node_output(node, out[i].type, &out[i].link);
+      }
+    }
+  }
+
+  BLI_addtail(&graph->nodes, node);
+  return true;
+}
+
 bool GPU_stack_link_zone(GPUMaterial *material,
                          const bNode *bnode,
                          const char *name,
@@ -1168,6 +1206,12 @@ static void gpu_node_free(GPUNode *node)
   }
 
   node->outputs.free_no_destruct();
+  if (node->source) {
+    MEM_delete(node->source);
+  }
+  if (node->owned_name) {
+    MEM_delete(node->owned_name);
+  }
   MEM_delete(node);
 }
 

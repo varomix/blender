@@ -17,6 +17,7 @@
 #include "BLI_math_matrix_types.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_set.hh"
+#include "BLI_span.hh"
 
 #include "DNA_customdata_types.h" /* for eCustomDataType */
 #include "DNA_image_types.h"
@@ -590,6 +591,9 @@ struct GPUNodeStack {
 struct GPUGraphOutput {
   std::string serialized;
   Vector<StringRefNull> dependencies;
+  /** Toast fork: definitions of runtime generated functions the graph calls, each one inside an
+   * include guard. Placed before the function that evaluates the graph. */
+  std::string functions;
 
   bool empty() const
   {
@@ -677,6 +681,22 @@ bool GPU_stack_link(GPUMaterial *mat,
                     GPUNodeStack *in,
                     GPUNodeStack *out,
                     ...);
+
+/**
+ * Toast fork: like #GPU_stack_link, but the function isn't from the material library: `source`
+ * defines it (any library functions it uses must be defined in it too). Arguments are the
+ * node's inputs, then `extra_inputs`, then the node's outputs. The function name should depend
+ * on the source, since materials are cached by their generated code. `extra_types` are the
+ * function's types for `extra_inputs` (values are converted to them).
+ */
+bool GPU_stack_link_source(GPUMaterial *material,
+                           const bNode *bnode,
+                           const char *name,
+                           const char *source,
+                           GPUNodeStack *in,
+                           GPUNodeStack *out,
+                           Span<GPUNodeLink *> extra_inputs,
+                           Span<GPUType> extra_types);
 
 bool GPU_stack_link_zone(GPUMaterial *material,
                          const bNode *bnode,

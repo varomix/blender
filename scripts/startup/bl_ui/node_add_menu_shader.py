@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 from bl_ui import node_add_menu
+from bl_ui.node_add_menu_toast import NODE_MT_shader_toast_base
 from bpy.app.translations import (
     contexts as i18n_contexts,
 )
@@ -565,6 +566,8 @@ class NODE_MT_shader_node_all_base(node_add_menu.NodeMenu):
         self.draw_menu(layout, "Texture")
         self.draw_menu(layout, "Utilities")
         layout.separator()
+        self.draw_menu(layout, "Toast")
+        layout.separator()
         self.draw_root_assets(layout)
         layout.separator()
         self.draw_menu(layout, "Group")
@@ -579,6 +582,7 @@ add_menus = {
     "NODE_MT_category_shader_color": NODE_MT_shader_node_color_base,
     "NODE_MT_category_shader_shader": NODE_MT_shader_node_shader_base,
     "NODE_MT_category_shader_texture": NODE_MT_shader_node_texture_base,
+    "NODE_MT_category_shader_toast": NODE_MT_shader_toast_base,
     "NODE_MT_category_shader_displacement": NODE_MT_shader_node_displacement_base,
     "NODE_MT_category_shader_vector": NODE_MT_shader_node_vector_base,
     "NODE_MT_category_shader_math": NODE_MT_shader_node_math_base,
@@ -601,6 +605,7 @@ swap_menus = {
     "NODE_MT_shader_node_color_swap": NODE_MT_shader_node_color_base,
     "NODE_MT_shader_node_shader_swap": NODE_MT_shader_node_shader_base,
     "NODE_MT_shader_node_texture_swap": NODE_MT_shader_node_texture_base,
+    "NODE_MT_shader_toast_swap": NODE_MT_shader_toast_base,
     "NODE_MT_shader_node_displacement_swap": NODE_MT_shader_node_displacement_base,
     "NODE_MT_shader_node_vector_swap": NODE_MT_shader_node_vector_base,
     "NODE_MT_shader_node_math_swap": NODE_MT_shader_node_math_base,

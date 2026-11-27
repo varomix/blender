@@ -99,6 +99,7 @@ class GPUCodegen {
 
   void node_serialize(Set<StringRefNull> &used_libraries,
                       std::stringstream &eval_ss,
+                      std::string &functions,
                       const GPUNode *node);
   GPUGraphOutput graph_serialize(GPUNodeTag tree_tag,
                                  GPUNodeLink *output_link,

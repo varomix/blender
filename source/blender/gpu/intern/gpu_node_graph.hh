@@ -89,6 +89,12 @@ struct GPUNode {
   /* Zones. */
   int zone_index;
   bool is_zone_end;
+
+  /** Toast fork: definition of the function this node calls, for functions generated at runtime
+   * instead of taken from the material library (see #GPU_stack_link_source). Owned, with the
+   * name in `owned_name`. */
+  char *source;
+  char *owned_name;
 };
 
 using GPUNodeLinkData = std::variant<const float *, const int *, const bool *>;
