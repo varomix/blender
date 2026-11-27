@@ -7877,6 +7877,84 @@ void OSLNode::compile(OSLCompiler &compiler)
   }
 }
 
+/* Toast (Toast fork) */
+
+ToastNode::ToastNode() : ShaderNode(new NodeType(NodeType::SHADER)) {}
+
+ToastNode::~ToastNode()
+{
+  delete type;
+}
+
+ToastNode *ToastNode::create(ShaderGraph *graph, const size_t num_inputs, const ToastNode *from)
+{
+  /* Space for the node and its input values, as OSLNode::create. */
+  const size_t node_size = align_up(sizeof(ToastNode), 16);
+  const size_t inputs_size = align_up(SocketType::max_size(), 16) * num_inputs;
+
+  char *node_memory = (char *)operator new(node_size + inputs_size);
+  memset(node_memory, 0, node_size + inputs_size);
+
+  if (!from) {
+    return graph->create_osl_node<ToastNode>(node_memory);
+  }
+  memcpy(node_memory + node_size, (char *)from + node_size, inputs_size);
+  ToastNode *node = graph->create_osl_node<ToastNode>(node_memory, *from);
+  node->type = new NodeType(*(from->type));
+  return node;
+}
+
+ShaderNode *ToastNode::clone(ShaderGraph *graph) const
+{
+  return ToastNode::create(graph, this->inputs.size(), this);
+}
+
+char *ToastNode::input_default_value()
+{
+  const size_t num_inputs = type->inputs.size();
+  const size_t inputs_size = align_up(SocketType::max_size(), 16) * num_inputs;
+  return (char *)this + align_up(sizeof(ToastNode), 16) + inputs_size;
+}
+
+void ToastNode::add_input(ustring name, SocketType::Type socket_type, const uint8_t value_type)
+{
+  char *memory = input_default_value();
+  const size_t offset = memory - (char *)this;
+  const_cast<NodeType *>(type)->register_input(
+      name, name, socket_type, offset, memory, nullptr, nullptr, SocketType::LINKABLE);
+  input_value_types.push_back(value_type);
+}
+
+void ToastNode::add_output(ustring name, SocketType::Type socket_type, const uint8_t value_type)
+{
+  const_cast<NodeType *>(type)->register_output(name, name, socket_type);
+  output_value_types.push_back(value_type);
+}
+
+void ToastNode::compile(SVMCompiler &compiler)
+{
+  SVMNodeToast node = {};
+  const uint64_t address = uint64_t(uintptr_t(function));
+  node.function_lo = uint(address & 0xFFFFFFFFu);
+  node.function_hi = uint(address >> 32);
+  node.num_inputs = uint8_t(min(inputs.size(), size_t(SVM_TOAST_MAX_INPUTS)));
+  node.num_outputs = uint8_t(min(outputs.size(), size_t(SVM_TOAST_MAX_OUTPUTS)));
+  for (int i = 0; i < node.num_inputs; i++) {
+    node.input_offset[i] = compiler.stack_assign(inputs[i]);
+    node.input_type[i] = NodeToastValue(input_value_types[i]);
+  }
+  for (int i = 0; i < node.num_outputs; i++) {
+    node.output_offset[i] = compiler.output(outputs[i]);
+    node.output_type[i] = NodeToastValue(output_value_types[i]);
+  }
+  compiler.add_node(this, NODE_TOAST, node);
+}
+
+void ToastNode::compile(OSLCompiler & /*compiler*/)
+{
+  /* Not with Open Shading Language: the Blender sync doesn't create the node then. */
+}
+
 /* Normal Map */
 
 NODE_DEFINE(NormalMapNode)

@@ -1342,4 +1342,35 @@ struct SVMNodeSceneTime {
 static_assert(alignof(SVMNodeSceneTime) <= alignof(uint));
 static_assert(sizeof(SVMNodeSceneTime) % sizeof(uint) == 0);
 
+/* NODE_TOAST (Toast fork): a function compiled from Toast code, called on the CPU with its inputs
+ * packed as floats (see `svm_node_toast`). */
+#define SVM_TOAST_MAX_INPUTS 32
+#define SVM_TOAST_MAX_OUTPUTS 16
+
+enum NodeToastValue : uint8_t {
+  /* One float. */
+  NODE_TOAST_FLOAT = 0,
+  /* Three floats. */
+  NODE_TOAST_FLOAT3,
+  /* An int or bool on the stack, one float for the function. */
+  NODE_TOAST_INT,
+  /* A color on the stack (three floats), four for the function: alpha 1 in, dropped out. */
+  NODE_TOAST_COLOR4,
+};
+
+struct SVMNodeToast {
+  /* The function's address, `void (*)(const float *in, float *out)`: valid on the CPU only. */
+  uint function_lo;
+  uint function_hi;
+  uint8_t num_inputs;
+  uint8_t num_outputs;
+  uint8_t _pad[2];
+  SVMStackOffset input_offset[SVM_TOAST_MAX_INPUTS];
+  NodeToastValue input_type[SVM_TOAST_MAX_INPUTS];
+  SVMStackOffset output_offset[SVM_TOAST_MAX_OUTPUTS];
+  NodeToastValue output_type[SVM_TOAST_MAX_OUTPUTS];
+};
+static_assert(alignof(SVMNodeToast) <= alignof(uint));
+static_assert(sizeof(SVMNodeToast) % sizeof(uint) == 0);
+
 CCL_NAMESPACE_END

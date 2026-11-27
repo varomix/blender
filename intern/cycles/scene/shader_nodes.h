@@ -1791,6 +1791,49 @@ class OSLNode final : public ShaderNode {
   bool has_emission;
 };
 
+/* Toast fork: a function compiled from Toast code (the shader editor's Toast node), called on the
+ * CPU (NODE_TOAST). Its sockets are made per node from the Toast code's signature, like OSLNode's.
+ * Inputs and outputs carry how their values are packed for the function (NodeToastValue). */
+class ToastNode final : public ShaderNode {
+ public:
+  static ToastNode *create(ShaderGraph *graph,
+                           const size_t num_inputs,
+                           const ToastNode *from = nullptr);
+  ToastNode();
+  ToastNode(const ToastNode &other) = default;
+  ~ToastNode() override;
+
+  static void operator delete(void *ptr)
+  {
+    /* Allocated with extra space at the end for the input values, as OSLNode. */
+    ::operator delete(ptr);
+  }
+  static void operator delete(void * /*unused*/, void * /*unused*/) {}
+
+  ShaderNode *clone(ShaderGraph *graph) const override;
+  void compile(SVMCompiler &compiler) override;
+  void compile(OSLCompiler &compiler) override;
+
+  /* `value_type` is a NodeToastValue. */
+  void add_input(ustring name, SocketType::Type type, uint8_t value_type);
+  void add_output(ustring name, SocketType::Type type, uint8_t value_type);
+  char *input_default_value();
+
+  bool has_spatial_varying() override
+  {
+    return true;
+  }
+  bool equals(const ShaderNode & /*other*/) override
+  {
+    return false;
+  }
+
+  /* `void (*)(const float *in, float *out)`, in the Blender process. */
+  void *function = nullptr;
+  vector<uint8_t> input_value_types;
+  vector<uint8_t> output_value_types;
+};
+
 class NormalMapNode : public ShaderNode {
  public:
   SHADER_NODE_CLASS(NormalMapNode)

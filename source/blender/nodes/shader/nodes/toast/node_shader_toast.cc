@@ -15,9 +15,10 @@
  * Scene Time nodes, so they have the same values as those nodes. Named attributes are passed as
  * float4, like to the Attribute node.
  *
- * EEVEE and the viewport only for now. Cycles doesn't know the node: its outputs are their
- * default values there. As with the geometry node, the code only runs when Auto Run Python
- * Scripts allows it; otherwise the outputs are their default values.
+ * EEVEE and the viewport use `gpu_source`. Cycles (CPU) calls the C++ function in
+ * `kernel_path`, see `toast_shader_info()` (NOD_toast.hh); on GPU devices the outputs are zero.
+ * As with the geometry node, the code only runs when Auto Run Python Scripts allows it;
+ * otherwise the outputs are their default values.
  */
 
 #include <sstream>
@@ -40,6 +41,7 @@
 #include "BLO_read_write.hh"
 
 #include "NOD_rna_define.hh"
+#include "NOD_toast.hh"
 
 #include "RNA_access.hh"
 #include "RNA_define.hh"
@@ -488,7 +490,11 @@ static char *dup_or_null(const char *str)
 static void node_free_storage(bNode *node)
 {
   NodeShaderToast *storage = static_cast<NodeShaderToast *>(node->storage);
-  for (char *str : {storage->signature, storage->gpu_source, storage->error, storage->source_hash})
+  for (char *str : {storage->signature,
+                     storage->gpu_source,
+                     storage->error,
+                     storage->source_hash,
+                     storage->kernel_path})
   {
     if (str) {
       MEM_delete(str);
@@ -505,14 +511,18 @@ static void node_copy_storage(bNodeTree * /*dst_tree*/, bNode *dst_node, const b
   dst->gpu_source = dup_or_null(src.gpu_source);
   dst->error = dup_or_null(src.error);
   dst->source_hash = dup_or_null(src.source_hash);
+  dst->kernel_path = dup_or_null(src.kernel_path);
   dst_node->storage = dst;
 }
 
 static void node_blend_write(const bNodeTree & /*tree*/, const bNode &node, BlendWriter &writer)
 {
   const NodeShaderToast &storage = node_storage(node);
-  for (const char *str :
-       {storage.signature, storage.gpu_source, storage.error, storage.source_hash})
+  for (const char *str : {storage.signature,
+                           storage.gpu_source,
+                           storage.error,
+                           storage.source_hash,
+                           storage.kernel_path})
   {
     if (str) {
       writer.write_string(str);
@@ -527,6 +537,7 @@ static void node_blend_read(bNodeTree & /*tree*/, bNode &node, BlendDataReader &
   BLO_read_string(&reader, &storage.gpu_source);
   BLO_read_string(&reader, &storage.error);
   BLO_read_string(&reader, &storage.source_hash);
+  BLO_read_string(&reader, &storage.kernel_path);
 }
 
 static void node_layout(ui::Layout &layout, bContext * /*C*/, PointerRNA *ptr)
@@ -638,6 +649,11 @@ static void node_rna(StructRNA *srna)
                                            rna_Node_update);
   def_string<&NodeShaderToast::error>(
       srna, "error", "Error", "Compile error of the code, empty if it compiled", rna_Node_update);
+  def_string<&NodeShaderToast::kernel_path>(srna,
+                                            "kernel_path",
+                                            "Kernel Path",
+                                            "The function compiled for the CPU (Cycles)",
+                                            rna_Node_update);
   def_string<&NodeShaderToast::source_hash>(srna,
                                             "source_hash",
                                             "Source Hash",
@@ -648,6 +664,41 @@ static void node_rna(StructRNA *srna)
 /** \} */
 
 }  // namespace nodes::node_shader_toast_cc
+
+namespace nodes {
+
+std::optional<ToastShaderInfo> toast_shader_info(const bNode &node, std::string &r_error)
+{
+  using namespace node_shader_toast_cc;
+  if (!(G.f & G_FLAG_SCRIPT_AUTOEXEC) || node.storage == nullptr) {
+    return std::nullopt;
+  }
+  const NodeShaderToast &storage = node_storage(node);
+  if ((storage.error && storage.error[0]) || !storage.kernel_path || !storage.kernel_path[0]) {
+    return std::nullopt;
+  }
+  const std::optional<Signature> sig = parse_signature(storage.signature);
+  if (!sig) {
+    return std::nullopt;
+  }
+  ToastShaderInfo info;
+  info.function = toast_load_shader_function(storage.kernel_path, r_error);
+  if (info.function == nullptr) {
+    return std::nullopt;
+  }
+  for (const SigParam &p : sig->params) {
+    info.params.append({param_identifier(p.name), p.type, ""});
+  }
+  for (const SigInput &i : sig->inputs) {
+    info.inputs.append({i.name, i.type, i.kind});
+  }
+  for (const SigOutput &o : sig->outputs) {
+    info.outputs.append({output_identifier(o.name), o.type, ""});
+  }
+  return info;
+}
+
+}  // namespace nodes
 
 void register_node_type_sh_toast()
 {

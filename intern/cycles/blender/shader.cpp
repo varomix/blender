@@ -30,6 +30,7 @@
 #include "NOD_shader.h"
 #include "NOD_shader_nodes_inline.hh"
 #include "NOD_shader_raycast.hh"
+#include "NOD_toast.hh"
 
 #include "DEG_depsgraph_query.hh"
 
@@ -351,6 +352,144 @@ static void raycast_add_output_attribute_sockets(RaycastNode *raycast,
           attribute_name, RaycastNode::ATTR_OUTPUT_FLOAT_ALPHA, alpha_output_identifier);
     }
   }
+}
+
+/* Toast fork: the shader editor's Toast node, a function compiled from Toast code for the CPU.
+ * Its shading inputs come from Cycles' own Geometry, Texture Coordinate, Color Attribute,
+ * Attribute and Scene Time nodes, so Bump's offset copies of the graph work as for textures. */
+static ShaderNode *add_toast_node(Scene *scene, ShaderGraph *graph, blender::bNode &b_node)
+{
+  if (scene->shader_manager->use_osl()) {
+    return nullptr;
+  }
+  std::string error;
+  const std::optional<blender::nodes::ToastShaderInfo> info = blender::nodes::toast_shader_info(
+      b_node, error);
+  if (!info) {
+    if (!error.empty()) {
+      LOG_WARNING << "Toast node " << b_node.name << ": " << error;
+    }
+    return nullptr;
+  }
+
+  struct Value {
+    SocketType::Type socket_type;
+    uint8_t value_type;
+  };
+  auto value_of = [](const std::string &type) -> Value {
+    if (type == "vec3") {
+      return {SocketType::VECTOR, NODE_TOAST_FLOAT3};
+    }
+    if (type == "vec4") {
+      return {SocketType::COLOR, NODE_TOAST_COLOR4};
+    }
+    if (type == "int" || type == "bool") {
+      return {SocketType::INT, NODE_TOAST_INT};
+    }
+    return {SocketType::FLOAT, NODE_TOAST_FLOAT};
+  };
+
+  /* A vec4 attribute is its color and its alpha, two inputs. */
+  size_t num_inputs = info->params.size();
+  for (const blender::nodes::ToastShaderSocket &input : info->inputs) {
+    num_inputs += (input.kind == "attribute" && input.type == "vec4") ? 2 : 1;
+  }
+  if (num_inputs > SVM_TOAST_MAX_INPUTS || info->outputs.size() > SVM_TOAST_MAX_OUTPUTS) {
+    LOG_WARNING << "Toast node " << b_node.name << ": too many inputs or outputs for Cycles";
+    return nullptr;
+  }
+
+  ToastNode *node = ToastNode::create(graph, num_inputs);
+  node->function = reinterpret_cast<void *>(info->function);
+  for (const blender::nodes::ToastShaderSocket &param : info->params) {
+    const Value v = value_of(param.type);
+    node->add_input(ustring(param.identifier), v.socket_type, v.value_type);
+  }
+  for (const blender::nodes::ToastShaderSocket &input : info->inputs) {
+    const string name = (input.kind == "builtin" ? "s_" : "a_") + input.identifier;
+    if (input.kind == "attribute" && input.type == "vec4") {
+      node->add_input(ustring(name), SocketType::COLOR, NODE_TOAST_FLOAT3);
+      node->add_input(ustring(name + "_alpha"), SocketType::FLOAT, NODE_TOAST_FLOAT);
+      continue;
+    }
+    const Value v = value_of(input.type);
+    node->add_input(ustring(name), v.socket_type, v.value_type);
+  }
+  for (const blender::nodes::ToastShaderSocket &output : info->outputs) {
+    const Value v = value_of(output.type);
+    node->add_output(ustring(output.identifier), v.socket_type, v.value_type);
+  }
+  node->create_inputs_outputs(node->type);
+
+  GeometryNode *geometry = nullptr;
+  TextureCoordinateNode *texco = nullptr;
+  SceneTimeNode *time = nullptr;
+  for (const blender::nodes::ToastShaderSocket &input : info->inputs) {
+    const string &name = input.identifier;
+    ShaderOutput *from = nullptr;
+    if (input.kind == "attribute") {
+      AttributeNode *attr = graph->create_node<AttributeNode>();
+      attr->set_attribute(ustring(name));
+      if (input.type == "vec4") {
+        graph->connect(attr->output("Color"), node->input(("a_" + name).c_str()));
+        graph->connect(attr->output("Alpha"), node->input(("a_" + name + "_alpha").c_str()));
+        continue;
+      }
+      /* As the Attribute node: Fac, or Vector. */
+      from = attr->output(input.type == "vec3" ? "Vector" : "Fac");
+    }
+    else if (name == "color") {
+      VertexColorNode *color = graph->create_node<VertexColorNode>();
+      from = color->output("Color");
+    }
+    else if (name == "time" || name == "frame") {
+      if (!time) {
+        time = graph->create_node<SceneTimeNode>();
+      }
+      from = time->output(name == "time" ? "Seconds" : "Frame");
+    }
+    else {
+      static const std::pair<const char *, const char *> geometry_outputs[] = {
+          {"position", "Position"},
+          {"normal", "Normal"},
+          {"true_normal", "True Normal"},
+          {"incoming", "Incoming"},
+          {"parametric", "Parametric"},
+          {"backfacing", "Backfacing"}};
+      static const std::pair<const char *, const char *> texco_outputs[] = {
+          {"generated", "Generated"},
+          {"uv", "UV"},
+          {"object", "Object"},
+          {"camera", "Camera"},
+          {"window", "Window"},
+          {"reflection", "Reflection"}};
+      auto find = [&](const auto &table) -> const char * {
+        for (const auto &[toast_name, socket] : table) {
+          if (name == toast_name) {
+            return socket;
+          }
+        }
+        return nullptr;
+      };
+      if (const char *socket = find(geometry_outputs)) {
+        if (!geometry) {
+          geometry = graph->create_node<GeometryNode>();
+        }
+        from = geometry->output(socket);
+      }
+      else if (const char *socket = find(texco_outputs)) {
+        if (!texco) {
+          texco = graph->create_node<TextureCoordinateNode>();
+        }
+        from = texco->output(socket);
+      }
+    }
+    ShaderInput *to = node->input(((input.kind == "builtin" ? "s_" : "a_") + name).c_str());
+    if (from && to) {
+      graph->connect(from, to);
+    }
+  }
+  return node;
 }
 
 static ShaderNode *add_node(Scene *scene,
@@ -906,6 +1045,9 @@ static ShaderNode *add_node(Scene *scene,
     (void)b_data;
     (void)b_ntree;
 #endif
+  }
+  else if (b_node.is_type("ShaderNodeToast"_ustr)) {
+    node = add_toast_node(scene, graph, b_node);
   }
   else if (b_node.is_type("ShaderNodeTexImage"_ustr)) {
     const auto &storage = *static_cast<blender::NodeTexImage *>(b_node.storage);

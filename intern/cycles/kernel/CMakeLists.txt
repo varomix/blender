@@ -98,6 +98,7 @@ set(SRC_KERNEL_SVM_HEADERS
   svm/radial_tiling_shared.h
   svm/raycast.h
   svm/scene_time.h
+  svm/toast.h
   svm/sepcomb_color.h
   svm/sepcomb_vector.h
   svm/sky.h

@@ -85,6 +85,7 @@
 #include "GEO_mesh_copy_selection.hh"
 
 #include "NOD_rna_define.hh"
+#include "NOD_toast.hh"
 
 #include "RNA_access.hh"
 #include "RNA_define.hh"
@@ -597,6 +598,83 @@ static const LoadedKernel *load_kernel(const StringRefNull path, std::string &r_
   return result;
 #endif
 }
+
+}  // namespace blender::nodes::node_geo_toast_cc
+
+namespace blender::nodes {
+
+ToastShaderFn toast_load_shader_function(const StringRefNull path, std::string &r_error)
+{
+#ifdef _WIN32
+  UNUSED_VARS(path);
+  r_error = "Toast shader functions are not supported on Windows yet";
+  return nullptr;
+#else
+  using namespace node_geo_toast_cc;
+  static std::mutex mutex;
+  static Map<std::string, ToastShaderFn> functions;
+  static Map<std::string, std::string> failures;
+
+  std::lock_guard lock{mutex};
+  if (const ToastShaderFn *fn = functions.lookup_ptr(path)) {
+    return *fn;
+  }
+  if (const std::string *error = failures.lookup_ptr(path)) {
+    r_error = *error;
+    return nullptr;
+  }
+  auto fail = [&](std::string message) -> ToastShaderFn {
+    failures.add(path, message);
+    r_error = std::move(message);
+    return nullptr;
+  };
+
+  ToastAbiVersionFn abi_fn = nullptr;
+  ToastShaderFn fn = nullptr;
+  if (StringRef(path).endswith(".cpp")) {
+    if (load_jit(r_error) == nullptr) {
+      return fail(r_error);
+    }
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file) {
+      return fail("Can't read shader source " + std::string(path));
+    }
+    std::stringstream source;
+    source << file.rdbuf();
+    const std::string cache_path = std::string(path).substr(0, path.size() - 4);
+    char error[4096] = "";
+    void *module = jit_compile(source.str().c_str(), cache_path.c_str(), error, sizeof(error));
+    if (module == nullptr) {
+      return fail(std::string("Shader function compile failed: ") + error);
+    }
+    abi_fn = reinterpret_cast<ToastAbiVersionFn>(jit_symbol(module, "toast_abi_version"));
+    fn = reinterpret_cast<ToastShaderFn>(jit_symbol(module, "toast_shader"));
+  }
+  else {
+    /* Libraries stay loaded: renders may still call their function. */
+    void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+      const char *err = dlerror();
+      return fail(std::string("Can't load shader function: ") + (err ? err : path.c_str()));
+    }
+    abi_fn = reinterpret_cast<ToastAbiVersionFn>(dlsym(handle, "toast_abi_version"));
+    fn = reinterpret_cast<ToastShaderFn>(dlsym(handle, "toast_shader"));
+  }
+  if (!abi_fn || !fn) {
+    return fail("Not a Toast shader function: " + std::string(path));
+  }
+  if (abi_fn() != TOAST_ABI_VERSION) {
+    return fail("Shader function built for another Toast version. It is recompiled "
+                "automatically when the Toast add-on is enabled");
+  }
+  functions.add(path, fn);
+  return fn;
+#endif
+}
+
+}  // namespace blender::nodes
+
+namespace blender::nodes::node_geo_toast_cc {
 
 /** \} */
 

@@ -3801,6 +3801,9 @@ struct NodeShaderToast {
   char *error = nullptr;
   /** Hash of the source the function was built from, so the add-on can tell when it is stale. */
   char *source_hash = nullptr;
+  /** The function compiled for the CPU (Cycles): C++ source for the built-in compiler or a
+   * shared library. */
+  char *kernel_path = nullptr;
 };
 
 struct NodeIndexSwitch {
