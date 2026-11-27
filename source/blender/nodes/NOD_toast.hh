@@ -53,6 +53,11 @@ struct ToastShaderSocket {
 
 struct ToastShaderInfo {
   ToastShaderFn function = nullptr;
+  /** The function for GPUs, in Blender's portable shader dialect (the node's `gpu_source`), and
+   * its name. Arguments: the params, then the shading inputs (named attributes as float4, as
+   * the Attribute node gets them), then the outputs as references. */
+  std::string gpu_source;
+  std::string gpu_function;
   Vector<ToastShaderSocket> params;
   Vector<ToastShaderSocket> inputs;
   Vector<ToastShaderSocket> outputs;

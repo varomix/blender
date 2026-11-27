@@ -196,6 +196,11 @@ class Device {
   /* constant memory */
   virtual void const_copy_to(const char *name, void *host, const size_t size) = 0;
 
+  /* Toast fork: source of the scene's Toast shader functions for devices that compile kernels
+   * from source (Metal), placed before the kernel source. Set before load_kernels(); a change
+   * makes the next load_kernels() build new kernels. */
+  virtual void set_toast_source(const string & /*source*/) {}
+
   /* load/compile kernels, must be called before adding tasks */
   virtual bool load_kernels(const uint64_t /*kernel_features*/)
   {

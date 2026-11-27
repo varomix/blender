@@ -205,6 +205,13 @@ class MultiDevice : public Device {
     return bvh_layout_mask;
   }
 
+  void set_toast_source(const string &source) override
+  {
+    for (SubDevice &sub : devices) {
+      sub.device->set_toast_source(source);
+    }
+  }
+
   bool load_kernels(const uint64_t kernel_features) override
   {
     for (SubDevice &sub : devices) {

@@ -1832,6 +1832,16 @@ class ToastNode final : public ShaderNode {
   void *function = nullptr;
   vector<uint8_t> input_value_types;
   vector<uint8_t> output_value_types;
+
+  /* Metal: the function in Metal Shading Language with a wrapper `metal_function(in, out)`
+   * taking the packed inputs and outputs, and its number for `toast_dispatch`. */
+  string metal_source;
+  string metal_function;
+  uint function_id = 0;
+
+  /* The source of all Toast functions of the scene's shaders for Device::set_toast_source (empty
+   * without any), numbering them for `toast_dispatch`. */
+  static string scene_source(Scene *scene);
 };
 
 class NormalMapNode : public ShaderNode {

@@ -26,6 +26,7 @@
 #include "scene/scene.h"
 #include "scene/scene_attributes.h"
 #include "scene/shader.h"
+#include "scene/shader_nodes.h"
 #include "scene/svm.h"
 #include "scene/tables.h"
 #include "scene/volume.h"
@@ -235,7 +236,13 @@ void Scene::device_update(Device *device_, Progress &progress)
      * we have to redo the first part of the scene update. */
     const uint64_t kernel_features = dscene.data.kernel_features;
     scene_updated_while_loading_kernels = false;
-    if (!kernels_loaded || loaded_kernel_features != kernel_features) {
+    /* Toast fork: devices that compile kernels from source (Metal) get the Toast functions. */
+    const string toast_source = ToastNode::scene_source(this);
+    device->set_toast_source(toast_source);
+    if (!kernels_loaded || loaded_kernel_features != kernel_features ||
+        loaded_toast_source != toast_source)
+    {
+      loaded_toast_source = toast_source;
       mutex.unlock();
       kernels_reloaded |= load_kernels(progress);
       mutex.lock();

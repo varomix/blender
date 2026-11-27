@@ -4,6 +4,8 @@
 
 #include "shader_nodes.h"
 
+#include <algorithm>
+
 #include "kernel/svm/node_types.h"
 #include "kernel/svm/types.h"
 #include "kernel/types.h"
@@ -17,6 +19,7 @@
 #include "scene/mesh.h"
 #include "scene/osl.h"
 #include "scene/scene.h"
+#include "scene/shader.h"
 #include "scene/shader_nodes.h"
 #include "scene/svm.h"
 
@@ -7947,7 +7950,63 @@ void ToastNode::compile(SVMCompiler &compiler)
     node.output_offset[i] = compiler.output(outputs[i]);
     node.output_type[i] = NodeToastValue(output_value_types[i]);
   }
+  node.function_id = function_id;
   compiler.add_node(this, NODE_TOAST, node);
+}
+
+string ToastNode::scene_source(Scene *scene)
+{
+  vector<ToastNode *> nodes;
+  for (const Shader *shader : scene->shaders) {
+    if (!shader->graph) {
+      continue;
+    }
+    for (ShaderNode *node : shader->graph->nodes) {
+      if (ToastNode *toast = dynamic_cast<ToastNode *>(node)) {
+        if (!toast->metal_function.empty()) {
+          nodes.push_back(toast);
+        }
+      }
+    }
+  }
+  if (nodes.empty()) {
+    return "";
+  }
+  /* Ordered by name, so the same functions always give the same source (and kernels). */
+  std::sort(nodes.begin(), nodes.end(), [](const ToastNode *a, const ToastNode *b) {
+    return a->metal_function < b->metal_function;
+  });
+
+  /* The Toast shader dialect (EEVEE's) as Metal: references, bit casts, atan(y, x). In a
+   * namespace, so `metal` names don't clash with Cycles' types. */
+  string source =
+      "#define __TOAST_FUNCTIONS__\n"
+      "#include <metal_stdlib>\n"
+      "namespace toast_metal {\n"
+      "using namespace metal;\n"
+      "using metal::atan;\n"
+      "#define _ref(T, x) thread T &x\n"
+      "inline uint floatBitsToUint(float f) { return as_type<uint>(f); }\n"
+      "inline float uintBitsToFloat(uint u) { return as_type<float>(u); }\n"
+      "inline float atan(float y, float x) { return atan2(y, x); }\n";
+  string dispatch =
+      "void toast_dispatch(int id, const thread float *in, thread float *out)\n{\n"
+      "  switch (id) {\n";
+  uint next_id = 0;
+  string previous;
+  for (ToastNode *node : nodes) {
+    if (node->metal_function != previous) {
+      previous = node->metal_function;
+      source += node->metal_source + "\n";
+      dispatch += string_printf(
+          "    case %u:\n      %s(in, out);\n      break;\n", next_id, previous.c_str());
+      next_id++;
+    }
+    node->function_id = next_id - 1;
+  }
+  dispatch += "    default:\n      break;\n  }\n}\n";
+  return source + dispatch + "}  // namespace toast_metal\nusing toast_metal::toast_dispatch;\n" +
+         "#undef _ref\n";
 }
 
 void ToastNode::compile(OSLCompiler & /*compiler*/)

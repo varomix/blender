@@ -269,6 +269,8 @@ class Scene : public NodeOwner {
 
   bool kernels_loaded;
   uint64_t loaded_kernel_features;
+  /* Toast fork: the Toast functions the kernels were loaded with (Device::set_toast_source). */
+  string loaded_toast_source;
 
   void update_kernel_features();
 

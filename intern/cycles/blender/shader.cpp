@@ -421,6 +421,78 @@ static ShaderNode *add_toast_node(Scene *scene, ShaderGraph *graph, blender::bNo
   }
   node->create_inputs_outputs(node->type);
 
+  /* Metal: the EEVEE function and a wrapper taking the inputs and outputs packed as floats, in
+   * the order of the CPU function (named attributes are float4s for the EEVEE function). */
+  if (!info->gpu_source.empty() && !info->gpu_function.empty()) {
+    const string wrapper = "toast_cycles_" + info->gpu_function;
+    string args, outs, body;
+    int k = 0;
+    auto floats = [&](const int n) {
+      string list;
+      for (int c = 0; c < n; c++) {
+        list += (c ? ", " : "") + string_printf("in[%d]", k + c);
+      }
+      k += n;
+      return list;
+    };
+    auto value = [&](const string &type) -> string {
+      if (type == "int") {
+        return "int(" + floats(1) + ")";
+      }
+      if (type == "bool") {
+        return "(" + floats(1) + " != 0.0f)";
+      }
+      if (type == "vec3") {
+        return "float3(" + floats(3) + ")";
+      }
+      if (type == "vec4") {
+        return "float4(" + floats(4) + ")";
+      }
+      return floats(1);
+    };
+    for (const blender::nodes::ToastShaderSocket &param : info->params) {
+      args += (args.empty() ? "" : ", ") + value(param.type);
+    }
+    for (const blender::nodes::ToastShaderSocket &input : info->inputs) {
+      string v;
+      if (input.kind != "attribute") {
+        v = value(input.type);
+      }
+      else if (input.type == "vec4") {
+        v = "float4(" + floats(4) + ")";
+      }
+      else if (input.type == "vec3") {
+        v = "float4(" + floats(3) + ", 0.0f)";
+      }
+      else {
+        /* The Attribute node's Fac is the average of the float4's xyz. */
+        const string f = floats(1);
+        v = "float4(" + f + ", " + f + ", " + f + ", " + f + ")";
+      }
+      args += (args.empty() ? "" : ", ") + v;
+    }
+    int j = 0;
+    k = 0;
+    for (const blender::nodes::ToastShaderSocket &output : info->outputs) {
+      const string type = output.type == "vec3" ? "float3" :
+                          output.type == "vec4" ? "float4" :
+                                                  output.type;
+      const string name = string_printf("o%d", j++);
+      body += "  " + type + " " + name + ";\n";
+      args += (args.empty() ? "" : ", ") + name;
+      const int n = output.size();
+      for (int c = 0; c < n; c++) {
+        outs += string_printf("  out[%d] = ", k + c) +
+                (n == 1 ? "float(" + name + ")" : name + "." + "xyzw"[c]) + ";\n";
+      }
+      k += n;
+    }
+    node->metal_function = wrapper;
+    node->metal_source = info->gpu_source + "\nvoid " + wrapper +
+                         "(const thread float *in, thread float *out)\n{\n" + body + "  " +
+                         info->gpu_function + "(" + args + ");\n" + outs + "}\n";
+  }
+
   GeometryNode *geometry = nullptr;
   TextureCoordinateNode *texco = nullptr;
   SceneTimeNode *time = nullptr;

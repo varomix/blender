@@ -418,6 +418,11 @@ string MetalDevice::preprocess_source(MetalPipelineType pso_type,
     global_defines += "#define __KERNEL_USE_DATA_CONSTANTS__\n";
   }
 
+  /* Toast fork: the scene's Toast shader functions (and a define enabling NODE_TOAST), before
+   * the kernel source so Cycles' macros don't apply to them. In the hash: new functions make new
+   * kernels. */
+  global_defines += toast_source;
+
   if (source) {
     *source = global_defines + *source;
   }

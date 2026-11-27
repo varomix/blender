@@ -682,6 +682,8 @@ std::optional<ToastShaderInfo> toast_shader_info(const bNode &node, std::string 
     return std::nullopt;
   }
   ToastShaderInfo info;
+  info.gpu_source = storage.gpu_source ? storage.gpu_source : "";
+  info.gpu_function = sig->function;
   info.function = toast_load_shader_function(storage.kernel_path, r_error);
   if (info.function == nullptr) {
     return std::nullopt;

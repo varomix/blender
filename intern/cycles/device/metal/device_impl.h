@@ -30,6 +30,8 @@ class MetalDevice : public Device {
   string source[PSO_NUM];
   string kernels_md5[PSO_NUM];
   string global_defines_md5[PSO_NUM];
+  /* Toast fork: see Device::set_toast_source. */
+  string toast_source;
 
   bool capture_enabled = false;
 
@@ -139,6 +141,11 @@ class MetalDevice : public Device {
   void refresh_source_and_kernels_md5(MetalPipelineType pso_type);
 
   void make_source(MetalPipelineType pso_type, uint64_t kernel_features);
+
+  void set_toast_source(const string &source) override
+  {
+    toast_source = source;
+  }
 
   bool load_kernels(uint64_t kernel_features) override;
 
