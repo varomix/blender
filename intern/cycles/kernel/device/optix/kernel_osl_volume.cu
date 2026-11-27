@@ -2,7 +2,11 @@
  *
  * SPDX-License-Identifier: Apache-2.0 */
 
-#define WITH_OSL
+/* Toast fork: built with `__TOAST_NODES__` instead of OSL for scenes with Toast nodes: the same
+ * modules shading in OptiX, with SVM calling the Toast functions (see kernel/svm/toast.h). */
+#ifndef __TOAST_NODES__
+#  define WITH_OSL
+#endif
 
 /* Volume shading raygens for OSL, loaded as a separate optix module so they
  * can be compiled in parallel with the base OSL module and skipped for
@@ -10,6 +14,9 @@
 
 #include "kernel/device/optix/compat.h"
 #include "kernel/device/optix/globals.h"
+#ifdef __TOAST_NODES__
+#  include "kernel/device/gpu/image.h" /* Toast fork: SVM looks up textures. */
+#endif
 
 #include "kernel/film/data_passes.h"
 

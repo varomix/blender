@@ -212,6 +212,13 @@ class MultiDevice : public Device {
     }
   }
 
+  void set_toast_cuda_functions(const string &source, const vector<string> &names) override
+  {
+    for (SubDevice &sub : devices) {
+      sub.device->set_toast_cuda_functions(source, names);
+    }
+  }
+
   bool load_kernels(const uint64_t kernel_features) override
   {
     for (SubDevice &sub : devices) {

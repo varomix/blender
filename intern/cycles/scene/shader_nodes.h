@@ -1841,8 +1841,11 @@ class ToastNode final : public ShaderNode {
 
   /* A Metal library with the Toast functions of the scene's shaders for
    * Device::set_toast_functions (empty without any): `[[visible]]` functions named in
-   * `r_functions`, in function-table order, which also sets each node's `function_id`. */
-  static string scene_source(Scene *scene, vector<string> &r_functions);
+   * `r_functions`, in function-table order, which also sets each node's `function_id`.
+   * `r_cuda_source`: the same functions as CUDA for Device::set_toast_cuda_functions. */
+  static string scene_source(Scene *scene,
+                             vector<string> &r_functions,
+                             string *r_cuda_source = nullptr);
 };
 
 class NormalMapNode : public ShaderNode {

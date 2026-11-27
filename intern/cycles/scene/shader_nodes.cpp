@@ -7954,9 +7954,207 @@ void ToastNode::compile(SVMCompiler &compiler)
   compiler.add_node(this, NODE_TOAST, node);
 }
 
-string ToastNode::scene_source(Scene *scene, vector<string> &r_functions)
+/* The Toast shader dialect (EEVEE's) as CUDA, compiled with NVRTC `-default-device`. In an
+ * anonymous namespace, so functions nothing calls are left out, and in `toast_cuda`, so the
+ * dialect's float2/3/4 (with constructors) hide CUDA's own vector types. */
+static const char *toast_cuda_prelude = R"(namespace {
+namespace toast_cuda {
+
+#define thread
+#define _ref(T, x) T &x
+#define TOAST_D __device__ __forceinline__
+
+typedef unsigned int uint;
+
+struct float2 {
+  float x, y;
+  TOAST_D float2() : x(0.0f), y(0.0f) {}
+  TOAST_D explicit float2(float s) : x(s), y(s) {}
+  TOAST_D float2(float x_, float y_) : x(x_), y(y_) {}
+};
+struct float3 {
+  float x, y, z;
+  TOAST_D float3() : x(0.0f), y(0.0f), z(0.0f) {}
+  TOAST_D explicit float3(float s) : x(s), y(s), z(s) {}
+  TOAST_D float3(float x_, float y_, float z_) : x(x_), y(y_), z(z_) {}
+};
+struct float4 {
+  float x, y, z, w;
+  TOAST_D float4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
+  TOAST_D explicit float4(float s) : x(s), y(s), z(s), w(s) {}
+  TOAST_D float4(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
+  TOAST_D float4(float3 v, float w_) : x(v.x), y(v.y), z(v.z), w(w_) {}
+};
+struct int3 {
+  int x, y, z;
+  TOAST_D int3() : x(0), y(0), z(0) {}
+  TOAST_D explicit int3(int s) : x(s), y(s), z(s) {}
+  TOAST_D int3(int x_, int y_, int z_) : x(x_), y(y_), z(z_) {}
+  TOAST_D explicit int3(float3 v) : x(int(v.x)), y(int(v.y)), z(int(v.z)) {}
+  TOAST_D explicit operator float3() const { return float3(float(x), float(y), float(z)); }
+};
+struct uint3 {
+  uint x, y, z;
+  TOAST_D uint3() : x(0u), y(0u), z(0u) {}
+  TOAST_D explicit uint3(uint s) : x(s), y(s), z(s) {}
+  TOAST_D uint3(uint x_, uint y_, uint z_) : x(x_), y(y_), z(z_) {}
+  TOAST_D explicit uint3(int3 v) : x(uint(v.x)), y(uint(v.y)), z(uint(v.z)) {}
+};
+
+/* Component-wise operators: vector-vector, vector-scalar, scalar-vector. */
+#define TOAST_OPS(V, S, OP, ...) \
+  TOAST_D V operator OP(V a, V b) { return V(__VA_ARGS__); } \
+  TOAST_D V operator OP(V a, S s) { const V b(s); return V(__VA_ARGS__); } \
+  TOAST_D V operator OP(S s, V b) { const V a(s); return V(__VA_ARGS__); } \
+  TOAST_D V &operator OP##=(V &a, V b) { return a = a OP b; } \
+  TOAST_D V &operator OP##=(V &a, S b) { return a = a OP b; }
+#define TOAST_OPS2(V, S, OP) TOAST_OPS(V, S, OP, a.x OP b.x, a.y OP b.y)
+#define TOAST_OPS3(V, S, OP) TOAST_OPS(V, S, OP, a.x OP b.x, a.y OP b.y, a.z OP b.z)
+#define TOAST_OPS4(V, S, OP) \
+  TOAST_OPS(V, S, OP, a.x OP b.x, a.y OP b.y, a.z OP b.z, a.w OP b.w)
+
+TOAST_OPS2(float2, float, +) TOAST_OPS2(float2, float, -)
+TOAST_OPS2(float2, float, *) TOAST_OPS2(float2, float, /)
+TOAST_OPS3(float3, float, +) TOAST_OPS3(float3, float, -)
+TOAST_OPS3(float3, float, *) TOAST_OPS3(float3, float, /)
+TOAST_OPS4(float4, float, +) TOAST_OPS4(float4, float, -)
+TOAST_OPS4(float4, float, *) TOAST_OPS4(float4, float, /)
+TOAST_OPS3(int3, int, +) TOAST_OPS3(int3, int, -) TOAST_OPS3(int3, int, *)
+TOAST_OPS3(int3, int, ^) TOAST_OPS3(int3, int, &) TOAST_OPS3(int3, int, |)
+TOAST_OPS3(int3, int, <<) TOAST_OPS3(int3, int, >>)
+TOAST_OPS3(uint3, uint, +) TOAST_OPS3(uint3, uint, -) TOAST_OPS3(uint3, uint, *)
+TOAST_OPS3(uint3, uint, ^) TOAST_OPS3(uint3, uint, &) TOAST_OPS3(uint3, uint, |)
+TOAST_OPS3(uint3, uint, <<) TOAST_OPS3(uint3, uint, >>)
+
+TOAST_D float2 operator-(float2 a) { return float2(-a.x, -a.y); }
+TOAST_D float3 operator-(float3 a) { return float3(-a.x, -a.y, -a.z); }
+TOAST_D float4 operator-(float4 a) { return float4(-a.x, -a.y, -a.z, -a.w); }
+TOAST_D int3 operator-(int3 a) { return int3(-a.x, -a.y, -a.z); }
+
+/* GLSL builtins, single precision. */
+TOAST_D float abs(float a) { return fabsf(a); }
+TOAST_D int abs(int a) { return a < 0 ? -a : a; }
+TOAST_D float floor(float a) { return floorf(a); }
+TOAST_D float2 floor(float2 a) { return float2(floorf(a.x), floorf(a.y)); }
+TOAST_D float3 floor(float3 a) { return float3(floorf(a.x), floorf(a.y), floorf(a.z)); }
+TOAST_D float4 floor(float4 a)
+{
+  return float4(floorf(a.x), floorf(a.y), floorf(a.z), floorf(a.w));
+}
+TOAST_D float ceil(float a) { return ceilf(a); }
+TOAST_D float trunc(float a) { return truncf(a); }
+TOAST_D float sqrt(float a) { return sqrtf(a); }
+TOAST_D float sin(float a) { return sinf(a); }
+TOAST_D float cos(float a) { return cosf(a); }
+TOAST_D float tan(float a) { return tanf(a); }
+TOAST_D float asin(float a) { return asinf(a); }
+TOAST_D float acos(float a) { return acosf(a); }
+TOAST_D float atan(float a) { return atanf(a); }
+TOAST_D float atan(float y, float x) { return atan2f(y, x); }
+TOAST_D float sinh(float a) { return sinhf(a); }
+TOAST_D float cosh(float a) { return coshf(a); }
+TOAST_D float tanh(float a) { return tanhf(a); }
+TOAST_D float exp(float a) { return expf(a); }
+TOAST_D float log(float a) { return logf(a); }
+TOAST_D float log2(float a) { return log2f(a); }
+TOAST_D float pow(float a, float b) { return powf(a, b); }
+TOAST_D float min(float a, float b) { return fminf(a, b); }
+TOAST_D float max(float a, float b) { return fmaxf(a, b); }
+TOAST_D int min(int a, int b) { return a < b ? a : b; }
+TOAST_D int max(int a, int b) { return a > b ? a : b; }
+TOAST_D uint floatBitsToUint(float f) { return __float_as_uint(f); }
+TOAST_D float uintBitsToFloat(uint u) { return __uint_as_float(u); }
+
+/* Swizzles of 2 to 4 components: `(v).zyx` becomes toast_swz3<2, 1, 0>(v), see
+ * toast_cuda_swizzles(). They are only ever read. */
+TOAST_D float toast_comp_w(const float2 &) { return 0.0f; }
+TOAST_D float toast_comp_w(const float3 &) { return 0.0f; }
+TOAST_D float toast_comp_w(const float4 &v) { return v.w; }
+template<int K, class V> TOAST_D float toast_comp(const V &v)
+{
+  return K == 0 ? v.x : K == 1 ? v.y : K == 2 ? v.z : toast_comp_w(v);
+}
+template<int A, int B, class V> TOAST_D float2 toast_swz2(const V &v)
+{
+  return float2(toast_comp<A>(v), toast_comp<B>(v));
+}
+template<int A, int B, int C, class V> TOAST_D float3 toast_swz3(const V &v)
+{
+  return float3(toast_comp<A>(v), toast_comp<B>(v), toast_comp<C>(v));
+}
+template<int A, int B, int C, int D, class V> TOAST_D float4 toast_swz4(const V &v)
+{
+  return float4(toast_comp<A>(v), toast_comp<B>(v), toast_comp<C>(v), toast_comp<D>(v));
+}
+
+#undef TOAST_OPS
+#undef TOAST_OPS2
+#undef TOAST_OPS3
+#undef TOAST_OPS4
+)";
+
+/* CUDA vectors have no swizzle members: `(base).xyz` and `name.f_field.xyz` (the dialect drops
+ * the parentheses around plain names) become `toast_swz3<0, 1, 2>(base)`. Single components
+ * (`.x`) are members and stay. */
+static string toast_cuda_swizzles(string code)
+{
+  auto is_name_char = [](const char c) { return isalnum((unsigned char)c) || c == '_'; };
+  size_t from = 0;
+  while (true) {
+    /* The next `.` followed by 2 to 4 of `xyzw` and not more name characters. */
+    size_t dot = string::npos, len = 0;
+    for (size_t i = code.find('.', from); i != string::npos; i = code.find('.', i + 1)) {
+      size_t n = 0;
+      while (i + 1 + n < code.size() && strchr("xyzw", code[i + 1 + n]) && code[i + 1 + n]) {
+        n++;
+      }
+      const bool ends = i + 1 + n >= code.size() || !is_name_char(code[i + 1 + n]);
+      if (n >= 2 && n <= 4 && ends && i > 0 && (code[i - 1] == ')' || is_name_char(code[i - 1])))
+      {
+        dot = i;
+        len = n;
+        break;
+      }
+    }
+    if (dot == string::npos) {
+      return code;
+    }
+    /* The start of its base: the matching parenthesis, or a name with its fields. */
+    size_t start = dot;
+    if (code[dot - 1] == ')') {
+      int depth = 0;
+      for (start = dot - 1;; start--) {
+        depth += code[start] == ')' ? 1 : (code[start] == '(' ? -1 : 0);
+        if (depth == 0 || start == 0) {
+          break;
+        }
+      }
+    }
+    else {
+      while (start > 0 && (is_name_char(code[start - 1]) || code[start - 1] == '.')) {
+        start--;
+      }
+    }
+    string base = code.substr(start, dot - start);
+    if (base.size() >= 2 && base.front() == '(' && base.back() == ')') {
+      base = base.substr(1, base.size() - 2);
+    }
+    string comps;
+    for (size_t k = 0; k < len; k++) {
+      comps += (k ? ", " : "") + std::to_string(strchr("xyzw", code[dot + 1 + k]) - "xyzw");
+    }
+    const string call = string_printf("toast_swz%d<%s>(", int(len), comps.c_str()) + base + ")";
+    code = code.substr(0, start) + call + code.substr(dot + 1 + len);
+    from = start;
+  }
+}
+
+string ToastNode::scene_source(Scene *scene, vector<string> &r_functions, string *r_cuda_source)
 {
   r_functions.clear();
+  if (r_cuda_source) {
+    r_cuda_source->clear();
+  }
   vector<ToastNode *> nodes;
   for (const Shader *shader : scene->shaders) {
     if (!shader->graph) {
@@ -7990,6 +8188,7 @@ string ToastNode::scene_source(Scene *scene, vector<string> &r_functions)
       "inline float uintBitsToFloat(uint u) { return as_type<float>(u); }\n"
       "inline float atan(float y, float x) { return atan2(y, x); }\n";
   string visible;
+  string cuda_source = toast_cuda_prelude, cuda_callables;
   for (ToastNode *node : nodes) {
     if (r_functions.empty() || r_functions.back() != node->metal_function) {
       const string &name = node->metal_function;
@@ -7998,8 +8197,18 @@ string ToastNode::scene_source(Scene *scene, vector<string> &r_functions)
       visible += "[[visible]] void " + name +
                  "(const thread float *in, thread float *out)\n{\n  toast_metal::" + name +
                  "(in, out);\n}\n";
+      if (r_cuda_source) {
+        cuda_source += toast_cuda_swizzles(node->metal_source) + "\n";
+        cuda_callables += "extern \"C\" __device__ void __direct_callable__" + name +
+                          "(const float *in, float *out)\n{\n  toast_cuda::" + name +
+                          "(in, out);\n}\n";
+      }
     }
     node->function_id = uint(r_functions.size() - 1);
+  }
+  if (r_cuda_source) {
+    *r_cuda_source = cuda_source + "}  // namespace toast_cuda\n}  // namespace\n#undef _ref\n" +
+                     "#undef thread\n" + cuda_callables;
   }
   return source + "}  // namespace toast_metal\n#undef _ref\n" + visible;
 }

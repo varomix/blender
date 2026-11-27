@@ -6,8 +6,9 @@
  * node). On the CPU it is native code in the Blender process, called by its address. On Metal
  * the kernels of a scene with Toast nodes (`__TOAST_NODES__`) call it through a function table,
  * the scene's Toast functions compiled on their own and linked in (see
- * MetalDevice::set_toast_functions), so new Toast code doesn't build new kernels. Other devices
- * write zero outputs. */
+ * MetalDevice::set_toast_functions), so new Toast code doesn't build new kernels. On OptiX the
+ * same kernels shade in OptiX (like OSL) and call the functions as direct callables, after the
+ * built-in ones (see OptiXDevice::set_toast_cuda_functions). Other devices write zero outputs. */
 
 #pragma once
 
@@ -16,7 +17,8 @@
 
 CCL_NAMESPACE_BEGIN
 
-#if !defined(__KERNEL_GPU__) || (defined(__KERNEL_METAL__) && defined(__TOAST_NODES__))
+#if !defined(__KERNEL_GPU__) || \
+    ((defined(__KERNEL_METAL__) || defined(__KERNEL_OPTIX__)) && defined(__TOAST_NODES__))
 #  define SVM_TOAST_CALLS
 #endif
 
@@ -53,7 +55,10 @@ ccl_device_noinline void svm_node_toast(ccl_private float *ccl_restrict stack,
       }
     }
   }
-#  ifdef __KERNEL_GPU__
+#  if defined(__KERNEL_OPTIX__)
+  /* After the two built-in callables (PG_CALL_SVM_AO, PG_CALL_SVM_BEVEL). */
+  optixDirectCall<void, const float *, float *>(2 + node.function_id, in, out);
+#  elif defined(__KERNEL_GPU__)
   metal_ancillaries->ft_toast[node.function_id](in, out);
 #  else
   using ToastShaderFn = void (*)(const float *, float *);

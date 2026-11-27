@@ -116,6 +116,22 @@ class OptiXDevice : public CUDADevice {
   device_vector<uint8_t> osl_colorsystem;
 #  endif
 
+  /* Toast fork: a scene with Toast nodes shades in OptiX like OSL, with the OSL kernel modules
+   * built with `__TOAST_NODES__`, and links its Toast functions (compiled with NVRTC) in as
+   * direct callables after the built-in ones. `toast_nodes`, `toast_source`, `toast_names`: the
+   * scene's functions (set_toast_cuda_functions). `toast_shading`: the loaded kernels are the
+   * Toast ones. Guarded by `toast_mutex`. */
+  thread_mutex toast_mutex;
+  bool toast_nodes = false;
+  bool toast_shading = false;
+  string toast_source;
+  vector<string> toast_names;
+  OptixModule toast_shadow_module = nullptr;
+  OptixModule toast_shadow_curve_module = nullptr;
+  OptixModule toast_volume_module = nullptr;
+  OptixModule toast_functions_module = nullptr;
+  vector<OptixProgramGroup> toast_groups;
+
   device_vector<SbtRecord> sbt_data;
   device_only_memory<KernelParamsOptiX> launch_params;
 
@@ -141,6 +157,11 @@ class OptiXDevice : public CUDADevice {
   bool load_kernels(uint64_t kernel_features) override;
 
   bool load_osl_kernels() override;
+
+  void set_toast_cuda_functions(const string &source, const vector<string> &names) override;
+  /* Compile the Toast functions and link the shading pipeline with them (toast_mutex held). */
+  bool load_toast_functions();
+  void free_toast_functions();
 
   bool build_optix_bvh(BVHOptiX *bvh,
                        OptixBuildOperation operation,

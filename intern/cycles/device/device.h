@@ -204,6 +204,14 @@ class Device {
   {
   }
 
+  /* Toast fork: the same functions for OptiX, as CUDA `source` with an
+   * `extern "C" __device__ void __direct_callable__<name>(const float *in, float *out)` for
+   * each name, in the same order. Same calling rules as set_toast_functions. */
+  virtual void set_toast_cuda_functions(const string & /*source*/,
+                                        const vector<string> & /*names*/)
+  {
+  }
+
   /* load/compile kernels, must be called before adding tasks */
   virtual bool load_kernels(const uint64_t /*kernel_features*/)
   {

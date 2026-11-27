@@ -54,7 +54,12 @@ bool OptiXDeviceQueue::enqueue(DeviceKernel kernel,
   const bool osl_camera = false;
 #  endif
 
-  if (!is_optix_specific_kernel(kernel, osl_shading, osl_camera)) {
+  /* Toast fork: scenes with Toast nodes shade in OptiX too, calling the Toast functions. */
+  const bool toast_shading = optix_device->toast_shading;
+
+  if (!is_optix_specific_kernel(kernel, osl_shading, osl_camera) &&
+      !(toast_shading && device_kernel_has_shading(kernel)))
+  {
     return CUDADeviceQueue::enqueue(kernel, work_size, args);
   }
 
@@ -209,6 +214,10 @@ bool OptiXDeviceQueue::enqueue(DeviceKernel kernel,
     sbt_params.callablesRecordCount += static_cast<unsigned int>(optix_device->osl_groups.size());
   }
 #  endif
+  if (toast_shading) {
+    sbt_params.callablesRecordCount += static_cast<unsigned int>(
+        optix_device->toast_groups.size());
+  }
 
   /* Launch the ray generation program. */
   optix_device_assert(optix_device,

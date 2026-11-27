@@ -167,6 +167,15 @@ OptiXDevice::~OptiXDevice()
   osl_colorsystem.free();
 #  endif
 
+  /* Toast fork. */
+  free_toast_functions();
+  for (OptixModule module : {toast_shadow_module, toast_shadow_curve_module, toast_volume_module})
+  {
+    if (module != nullptr) {
+      optixModuleDestroy(module);
+    }
+  }
+
   optixDeviceContextDestroy(context);
 }
 
@@ -208,6 +217,11 @@ string OptiXDevice::compile_kernel_get_common_cflags(const uint64_t kernel_featu
   /* Specialization for shader ray-tracing. */
   if (kernel_features & KERNEL_FEATURE_NODE_RAYTRACE) {
     common_cflags += " --keep-device-functions";
+  }
+
+  /* Toast fork: the OSL modules shading with SVM and calling Toast functions. */
+  if (toast_shading) {
+    common_cflags += " -D __TOAST_NODES__";
   }
 
   return common_cflags;
@@ -286,14 +300,22 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
   const bool need_optix_kernels = (kernel_features &
                                    (KERNEL_FEATURE_PATH_TRACING | KERNEL_FEATURE_BAKING));
 
+  /* Toast fork: with Toast nodes, the OSL modules built for Toast (`__TOAST_NODES__`, never
+   * the precompiled OSL ones) shade in OptiX. Toast nodes aren't made with OSL shading. */
+  thread_scoped_lock toast_lock(toast_mutex);
+  const bool use_toast_shading = toast_nodes && need_optix_kernels && !use_osl_shading;
+  const bool use_toast_volume = use_toast_shading && (kernel_features & KERNEL_FEATURE_VOLUME);
+  toast_shading = use_toast_shading;
+  const bool use_optix_shading = use_osl_shading || use_toast_shading;
+
   /* Detect existence of OptiX kernel and SDK here early. So we can error out
    * before compiling the CUDA kernels, to avoid failing right after when
    * compiling the OptiX kernel. */
-  string suffix = use_osl_shading ? "_osl" : "";
+  string suffix = use_optix_shading ? "_osl" : "";
   string ptx_filename;
   if (need_optix_kernels) {
     ptx_filename = path_get("lib/kernel_optix" + suffix + ".ptx.zst");
-    if (use_adaptive_compilation() || path_file_size(ptx_filename) == -1) {
+    if (use_adaptive_compilation() || path_file_size(ptx_filename) == -1 || use_toast_shading) {
       std::string optix_include_dir = get_optix_include_dir();
       if (optix_include_dir.empty()) {
         set_error(
@@ -389,6 +411,16 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
   osl_groups.clear();
 #  endif
 
+  /* Toast fork: its modules, which also link against the base module. */
+  free_toast_functions();
+  for (OptixModule *module : {&toast_shadow_module, &toast_shadow_curve_module, &toast_volume_module})
+  {
+    if (*module != nullptr) {
+      optixModuleDestroy(*module);
+      *module = nullptr;
+    }
+  }
+
   OptixModuleCompileOptions module_options = {};
   module_options.maxRegisterCount = 0; /* Do not set an explicit register limit. */
 
@@ -437,7 +469,7 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
   { /* Load and compile PTX modules with OptiX kernels.
      * All in one TaskPool so the OptiX driver can compile them concurrently. */
     string base_ptx_data;
-    if (use_adaptive_compilation() || path_file_size(ptx_filename) == -1) {
+    if (use_adaptive_compilation() || path_file_size(ptx_filename) == -1 || use_toast_shading) {
       string cflags = compile_kernel_get_common_cflags(kernel_features);
       ptx_filename = compile_kernel(cflags, ("kernel" + suffix).c_str(), true);
     }
@@ -447,10 +479,10 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
       return false;
     }
 
-    auto load_optional_module = [this, &kernel_features](const string &name,
-                                                         string &ptx_data) -> bool {
+    auto load_optional_module = [this, &kernel_features, use_toast_shading](
+                                    const string &name, string &ptx_data) -> bool {
       string filename = path_get("lib/" + name + ".ptx.zst");
-      if (use_adaptive_compilation() || path_file_size(filename) == -1) {
+      if (use_adaptive_compilation() || path_file_size(filename) == -1 || use_toast_shading) {
         /* Map kernel_optix_foo.ptx to kernel_foo.cu. */
         const char *suffix = "_optix";
         string source_name = name;
@@ -473,15 +505,15 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
 
     string mnee_ptx_data;
     if (use_mnee &&
-        !load_optional_module(use_osl_shading ? "kernel_optix_osl_mnee" : "kernel_optix_mnee",
+        !load_optional_module(use_optix_shading ? "kernel_optix_osl_mnee" : "kernel_optix_mnee",
                               mnee_ptx_data))
     {
       return false;
     }
     string shader_raytrace_ptx_data;
     if (use_shader_raytrace &&
-        !load_optional_module(use_osl_shading ? "kernel_optix_osl_shader_raytrace" :
-                                                "kernel_optix_shader_raytrace",
+        !load_optional_module(use_optix_shading ? "kernel_optix_osl_shader_raytrace" :
+                                                  "kernel_optix_shader_raytrace",
                               shader_raytrace_ptx_data))
     {
       return false;
@@ -506,6 +538,16 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
       return false;
     }
 #  endif
+    /* Toast fork: the shading modules OSL has on its own, built for Toast. */
+    string toast_shadow_ptx_data, toast_shadow_curve_ptx_data, toast_volume_ptx_data;
+    if (use_toast_shading &&
+        (!load_optional_module("kernel_optix_osl_shadow", toast_shadow_ptx_data) ||
+         !load_optional_module("kernel_optix_osl_shadow_curve", toast_shadow_curve_ptx_data) ||
+         (use_toast_volume &&
+          !load_optional_module("kernel_optix_osl_volume", toast_volume_ptx_data))))
+    {
+      return false;
+    }
 
     TaskPool pool;
     OptixResult base_result = OPTIX_SUCCESS;
@@ -517,6 +559,9 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
     OptixResult osl_shadow_curve_result = OPTIX_SUCCESS;
     OptixResult osl_volume_result = OPTIX_SUCCESS;
 #  endif
+    OptixResult toast_shadow_result = OPTIX_SUCCESS;
+    OptixResult toast_shadow_curve_result = OPTIX_SUCCESS;
+    OptixResult toast_volume_result = OPTIX_SUCCESS;
 
     const scoped_timer load_module_timer;
     LOG_INFO << "OptiX: Creating modules.";
@@ -550,6 +595,19 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
           pool, module_options, osl_volume_ptx_data, osl_volume_module, osl_volume_result);
     }
 #  endif
+    if (use_toast_shading) {
+      create_optix_module(
+          pool, module_options, toast_shadow_ptx_data, toast_shadow_module, toast_shadow_result);
+      create_optix_module(pool,
+                          module_options,
+                          toast_shadow_curve_ptx_data,
+                          toast_shadow_curve_module,
+                          toast_shadow_curve_result);
+    }
+    if (use_toast_volume) {
+      create_optix_module(
+          pool, module_options, toast_volume_ptx_data, toast_volume_module, toast_volume_result);
+    }
     pool.wait_work();
     LOG_INFO << "OptiX: modules created in " << load_module_timer.get_time() << " seconds.";
 
@@ -591,6 +649,15 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
       return false;
     }
 #  endif
+    for (const OptixResult result :
+         {toast_shadow_result, toast_shadow_curve_result, toast_volume_result})
+    {
+      if (result != OPTIX_SUCCESS) {
+        set_error(string_printf("Failed to load OptiX Toast shading kernel (%s)",
+                                optixGetErrorName(result)));
+        return false;
+      }
+    }
   }
 
   /* Create program groups. */
@@ -759,9 +826,22 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
         "__raygen__kernel_optix_integrator_intersect_mnee";
   }
 
+  /* Toast fork: the shading modules of OSL or of Toast, which shades in OptiX the same way. */
 #  ifdef WITH_OSL
+  OptixModule shade_shadow_module = use_osl_shading ? osl_shadow_module : toast_shadow_module;
+  OptixModule shade_shadow_curve_module = use_osl_shading ? osl_shadow_curve_module :
+                                                            toast_shadow_curve_module;
+  OptixModule shade_volume_module = use_osl_shading ? osl_volume_module : toast_volume_module;
+  const bool use_shade_volume = use_osl_volume || use_toast_volume;
+#  else
+  OptixModule shade_shadow_module = toast_shadow_module;
+  OptixModule shade_shadow_curve_module = toast_shadow_curve_module;
+  OptixModule shade_volume_module = toast_volume_module;
+  const bool use_shade_volume = use_toast_volume;
+#  endif
+
   /* OSL uses direct callables to execute, so shading needs to be done in OptiX if OSL is used. */
-  if (use_osl_shading) {
+  if (use_optix_shading) {
     group_descs[PG_RGEN_SHADE_BACKGROUND].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
     group_descs[PG_RGEN_SHADE_BACKGROUND].raygen.module = optix_module;
     group_descs[PG_RGEN_SHADE_BACKGROUND].raygen.entryFunctionName =
@@ -778,18 +858,18 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
     group_descs[PG_RGEN_SHADE_SURFACE].raygen.module = optix_module;
     group_descs[PG_RGEN_SHADE_SURFACE].raygen.entryFunctionName =
         "__raygen__kernel_optix_integrator_shade_surface";
-    if (use_osl_volume) {
+    if (use_shade_volume) {
       group_descs[PG_RGEN_SHADE_VOLUME].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-      group_descs[PG_RGEN_SHADE_VOLUME].raygen.module = osl_volume_module;
+      group_descs[PG_RGEN_SHADE_VOLUME].raygen.module = shade_volume_module;
       group_descs[PG_RGEN_SHADE_VOLUME].raygen.entryFunctionName =
           "__raygen__kernel_optix_integrator_shade_volume";
       group_descs[PG_RGEN_SHADE_VOLUME_RAY_MARCHING].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-      group_descs[PG_RGEN_SHADE_VOLUME_RAY_MARCHING].raygen.module = osl_volume_module;
+      group_descs[PG_RGEN_SHADE_VOLUME_RAY_MARCHING].raygen.module = shade_volume_module;
       group_descs[PG_RGEN_SHADE_VOLUME_RAY_MARCHING].raygen.entryFunctionName =
           "__raygen__kernel_optix_integrator_shade_volume_ray_marching";
     }
     group_descs[PG_RGEN_SHADE_SHADOW].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-    group_descs[PG_RGEN_SHADE_SHADOW].raygen.module = osl_shadow_module;
+    group_descs[PG_RGEN_SHADE_SHADOW].raygen.module = shade_shadow_module;
     group_descs[PG_RGEN_SHADE_SHADOW].raygen.entryFunctionName =
         "__raygen__kernel_optix_integrator_shade_shadow";
     group_descs[PG_RGEN_SHADE_DEDICATED_LIGHT].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
@@ -805,7 +885,8 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
     group_descs[PG_RGEN_EVAL_BACKGROUND].raygen.entryFunctionName =
         "__raygen__kernel_optix_shader_eval_background";
     group_descs[PG_RGEN_EVAL_CURVE_SHADOW_TRANSPARENCY].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-    group_descs[PG_RGEN_EVAL_CURVE_SHADOW_TRANSPARENCY].raygen.module = osl_shadow_curve_module;
+    group_descs[PG_RGEN_EVAL_CURVE_SHADOW_TRANSPARENCY].raygen.module =
+        shade_shadow_curve_module;
     group_descs[PG_RGEN_EVAL_CURVE_SHADOW_TRANSPARENCY].raygen.entryFunctionName =
         "__raygen__kernel_optix_shader_eval_curve_shadow_transparency";
     group_descs[PG_RGEN_EVAL_VOLUME_DENSITY].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
@@ -814,6 +895,7 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
         "__raygen__kernel_optix_shader_eval_volume_density";
   }
 
+#  ifdef WITH_OSL
   /* When using custom OSL cameras, integrator_init_from_camera is its own specialized module. */
   if (use_osl_camera) {
     group_descs[PG_RGEN_INIT_FROM_CAMERA].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
@@ -862,6 +944,9 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
 
   if (use_osl_shading || use_osl_camera) {
     /* OSL kernels will be (re)created on by OSL manager. */
+  }
+  else if (use_toast_shading) {
+    /* Toast fork: linked with the Toast functions below. */
   }
   else if (use_shader_raytrace || use_mnee) {
     /* Create shader ray-tracing and MNEE pipeline. */
@@ -959,6 +1044,11 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
 
     optix_assert(optixPipelineSetStackSize(
         pipelines[PIP_INTERSECT], 0, 0, css, pipeline_options.usesMotionBlur ? 3 : 2));
+  }
+
+  /* Toast fork: the shading pipeline, with the scene's Toast functions. */
+  if (use_toast_shading && !load_toast_functions()) {
+    return false;
   }
 
   return !have_error();
@@ -1326,6 +1416,250 @@ bool OptiXDevice::load_osl_kernels()
 #  else
   return false;
 #  endif
+}
+
+/* Toast fork */
+
+void OptiXDevice::set_toast_cuda_functions(const string &source, const vector<string> &names)
+{
+  thread_scoped_lock lock(toast_mutex);
+  toast_nodes = !names.empty();
+  if (source == toast_source && names == toast_names) {
+    return;
+  }
+  toast_source = source;
+  toast_names = names;
+  /* With the Toast kernels loaded, link the new functions in now. Otherwise load_kernels() does
+   * (the scene loads new kernels when it gets its first Toast node). */
+  if (toast_shading && toast_nodes) {
+    load_toast_functions();
+  }
+}
+
+void OptiXDevice::free_toast_functions()
+{
+  for (OptixProgramGroup group : toast_groups) {
+    if (group != nullptr) {
+      optixProgramGroupDestroy(group);
+    }
+  }
+  toast_groups.clear();
+  if (toast_functions_module != nullptr) {
+    optixModuleDestroy(toast_functions_module);
+    toast_functions_module = nullptr;
+  }
+}
+
+/* PTX of the CUDA `source`, or empty with the reason in `r_log`. */
+static string toast_nvrtc_compile(const string &source,
+                                  const int major,
+                                  const int minor,
+                                  string &r_log)
+{
+#  ifdef WITH_CUDA_DYNLOAD
+  if (cuewInit(CUEW_INIT_NVRTC) != CUEW_SUCCESS || nvrtcCreateProgram == nullptr) {
+    r_log = "NVRTC (libnvrtc.so of the CUDA toolkit) not found";
+    return "";
+  }
+  nvrtcProgram program = nullptr;
+  if (nvrtcCreateProgram(&program, source.c_str(), "toast.cu", 0, nullptr, nullptr) !=
+      NVRTC_SUCCESS)
+  {
+    r_log = "nvrtcCreateProgram failed";
+    return "";
+  }
+  /* The functions are plain functions in the dialect: device functions by default. Relocatable,
+   * so the callables are kept for OptiX to link. */
+  const string arch = string_printf("--gpu-architecture=compute_%d%d", major, minor);
+  const char *options[] = {arch.c_str(), "-default-device", "-rdc=true", "-std=c++17"};
+  const nvrtcResult result = nvrtcCompileProgram(program, 4, options);
+  size_t size = 0;
+  nvrtcGetProgramLogSize(program, &size);
+  r_log.assign(size, '\0');
+  if (size > 0) {
+    nvrtcGetProgramLog(program, r_log.data());
+  }
+  string ptx;
+  if (result == NVRTC_SUCCESS && nvrtcGetPTXSize(program, &size) == NVRTC_SUCCESS) {
+    ptx.assign(size, '\0');
+    nvrtcGetPTX(program, ptx.data());
+    while (!ptx.empty() && ptx.back() == '\0') {
+      ptx.pop_back();
+    }
+  }
+  nvrtcDestroyProgram(&program);
+  return ptx;
+#  else
+  (void)source;
+  (void)major;
+  (void)minor;
+  r_log = "Blender was built without WITH_CUDA_DYNLOAD, which NVRTC is loaded with";
+  return "";
+#  endif
+}
+
+bool OptiXDevice::load_toast_functions()
+{
+  if (have_error() || optix_module == nullptr) {
+    return false;
+  }
+  const CUDAContextScope scope(this);
+
+  if (pipelines[PIP_SHADE] != nullptr) {
+    optixPipelineDestroy(pipelines[PIP_SHADE]);
+    pipelines[PIP_SHADE] = nullptr;
+  }
+  free_toast_functions();
+
+  /* Same target as the kernels (see CUDADevice::compile_kernel). */
+  int major, minor;
+  cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevId);
+  cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevId);
+  if (major >= 9) {
+    major = 8;
+    minor = 9;
+  }
+
+  const double starttime = time_dt();
+  string log;
+  string ptx = toast_nvrtc_compile(toast_source, major, minor, log);
+  if (ptx.empty()) {
+    /* Zero outputs, so every node still has a function to call. */
+    LOG_ERROR << "Toast: CUDA functions failed to compile: " << log;
+    string zero;
+    for (const string &name : toast_names) {
+      zero += "extern \"C\" __device__ void __direct_callable__" + name +
+              "(const float *, float *) {}\n";
+    }
+    ptx = toast_nvrtc_compile(zero, major, minor, log);
+    if (ptx.empty()) {
+      set_error("Toast: failed to compile CUDA functions: " + log);
+      return false;
+    }
+  }
+
+  OptixModuleCompileOptions module_options = {};
+  module_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_LEVEL_3;
+  module_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
+  {
+    TaskPool pool;
+    OptixResult result = OPTIX_SUCCESS;
+    create_optix_module(pool, module_options, ptx, toast_functions_module, result);
+    pool.wait_work();
+    if (result != OPTIX_SUCCESS) {
+      set_error(string_printf("Failed to load OptiX Toast functions (%s)",
+                              optixGetErrorName(result)));
+      return false;
+    }
+  }
+
+  /* One direct callable per function, in NODE_TOAST's numbering. */
+  vector<string> entries;
+  for (const string &name : toast_names) {
+    entries.push_back("__direct_callable__" + name);
+  }
+  vector<OptixProgramGroupDesc> descs(entries.size());
+  for (size_t i = 0; i < entries.size(); i++) {
+    descs[i].kind = OPTIX_PROGRAM_GROUP_KIND_CALLABLES;
+    descs[i].callables.moduleDC = toast_functions_module;
+    descs[i].callables.entryFunctionNameDC = entries[i].c_str();
+  }
+  toast_groups.assign(entries.size(), nullptr);
+  OptixProgramGroupOptions group_options = {};
+  if (!descs.empty()) {
+    optix_assert(optixProgramGroupCreate(context,
+                                         descs.data(),
+                                         descs.size(),
+                                         &group_options,
+                                         nullptr,
+                                         nullptr,
+                                         toast_groups.data()));
+  }
+
+  /* Shader binding table: the built-in groups, then the Toast callables. */
+  sbt_data.alloc(NUM_PROGRAM_GROUPS + toast_groups.size());
+  memset(sbt_data.host_pointer, 0, sizeof(SbtRecord) * sbt_data.size());
+  for (int i = 0; i < NUM_PROGRAM_GROUPS; ++i) {
+    if (groups[i] != nullptr) {
+      optix_assert(optixSbtRecordPackHeader(groups[i], &sbt_data[i]));
+    }
+  }
+  for (size_t i = 0; i < toast_groups.size(); ++i) {
+    optix_assert(optixSbtRecordPackHeader(toast_groups[i], &sbt_data[NUM_PROGRAM_GROUPS + i]));
+  }
+  sbt_data.copy_to_device();
+
+  /* The shading pipeline, as for OSL (see load_osl_kernels). */
+  OptixPipelineLinkOptions link_options = {};
+  link_options.maxTraceDepth = 0;
+  vector<OptixProgramGroup> pipeline_groups;
+  for (const int group : {PG_RGEN_SHADE_BACKGROUND,
+                          PG_RGEN_SHADE_LIGHT_NEE,
+                          PG_RGEN_SHADE_LIGHT_FORWARD,
+                          PG_RGEN_SHADE_SURFACE,
+                          PG_RGEN_SHADE_SURFACE_RAYTRACE,
+                          PG_CALL_SVM_AO,
+                          PG_CALL_SVM_BEVEL,
+                          PG_RGEN_INTERSECT_MNEE,
+                          PG_RGEN_SHADE_VOLUME,
+                          PG_RGEN_SHADE_VOLUME_RAY_MARCHING,
+                          PG_RGEN_SHADE_SHADOW,
+                          PG_RGEN_SHADE_DEDICATED_LIGHT,
+                          PG_RGEN_EVAL_DISPLACE,
+                          PG_RGEN_EVAL_BACKGROUND,
+                          PG_RGEN_EVAL_CURVE_SHADOW_TRANSPARENCY,
+                          PG_RGEN_EVAL_VOLUME_DENSITY})
+  {
+    if (groups[group] != nullptr) {
+      pipeline_groups.push_back(groups[group]);
+    }
+  }
+  /* For shader ray-tracing, trace depth and hit program groups are needed. */
+  if (groups[PG_RGEN_SHADE_SURFACE_RAYTRACE] != nullptr ||
+      groups[PG_RGEN_INTERSECT_MNEE] != nullptr)
+  {
+    link_options.maxTraceDepth = 1;
+    add_hit_miss_program_groups(groups, pipeline_groups);
+  }
+  for (OptixProgramGroup group : toast_groups) {
+    pipeline_groups.push_back(group);
+  }
+
+  optix_assert(optixPipelineCreate(context,
+                                   &pipeline_options,
+                                   &link_options,
+                                   pipeline_groups.data(),
+                                   pipeline_groups.size(),
+                                   nullptr,
+                                   nullptr,
+                                   &pipelines[PIP_SHADE]));
+  if (pipelines[PIP_SHADE] == nullptr) {
+    return false;
+  }
+
+  OptixStackSizes stack_size[NUM_PROGRAM_GROUPS] = {};
+  for (int i = 0; i < NUM_PROGRAM_GROUPS; ++i) {
+    if (groups[i] != nullptr) {
+      optix_assert(optixProgramGroupGetStackSize(groups[i], &stack_size[i], pipelines[PIP_SHADE]));
+    }
+  }
+  const unsigned int trace_css = hit_program_continuation_stack_size(stack_size);
+  const unsigned int css = std::max(stack_size[PG_RGEN_SHADE_SURFACE_RAYTRACE].cssRG,
+                                    stack_size[PG_RGEN_INTERSECT_MNEE].cssRG) +
+                           link_options.maxTraceDepth * trace_css;
+  unsigned int dss = std::max(stack_size[PG_CALL_SVM_AO].dssDC,
+                              stack_size[PG_CALL_SVM_BEVEL].dssDC);
+  for (OptixProgramGroup group : toast_groups) {
+    OptixStackSizes sizes = {};
+    optix_assert(optixProgramGroupGetStackSize(group, &sizes, pipelines[PIP_SHADE]));
+    dss = std::max(dss, sizes.dssDC);
+  }
+  optix_assert(optixPipelineSetStackSize(
+      pipelines[PIP_SHADE], 0, dss, css, pipeline_options.usesMotionBlur ? 3 : 2));
+
+  LOG_INFO << "Toast: " << toast_names.size() << " CUDA functions linked in "
+           << (time_dt() - starttime) * 1000.0 << " ms";
+  return !have_error();
 }
 
 OSLGlobals *OptiXDevice::get_cpu_osl_memory()
